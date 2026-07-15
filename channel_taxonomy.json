@@ -1,0 +1,96 @@
+{
+  "taxonomy_version": "1.0.0",
+  "fallback": "待确认",
+  "domains": [
+    {
+      "label": "户外/露营",
+      "keywords": ["outdoor", "outdoors", "camping", "camp gear", "hiking", "backpacking", "bushcraft", "survival", "tent", "露营", "户外", "徒步", "登山", "野营", "帐篷"]
+    },
+    {
+      "label": "EDC/照明",
+      "keywords": ["edc", "everyday carry", "flashlight", "torch", "headlamp", "lantern", "knife", "multitool", "照明", "手电", "头灯", "营地灯", "随身装备"]
+    },
+    {
+      "label": "科技数码",
+      "keywords": ["technology", "tech", "gadget", "smartphone", "laptop", "computer", "camera gear", "electronics", "科技", "数码", "手机", "电脑", "智能设备", "电子产品"]
+    },
+    {
+      "label": "家居/DIY",
+      "keywords": ["diy", "woodworking", "home improvement", "home decor", "workshop", "maker", "tools", "家居", "装修", "木工", "手工", "工具", "改造"]
+    },
+    {
+      "label": "健身/健康",
+      "keywords": ["fitness", "workout", "training", "gym", "running", "health", "wellness", "nutrition", "健身", "训练", "跑步", "健康", "营养", "瑜伽"]
+    },
+    {
+      "label": "美妆/个护",
+      "keywords": ["beauty", "makeup", "skincare", "haircare", "cosmetics", "grooming", "美妆", "护肤", "彩妆", "个护", "发型"]
+    },
+    {
+      "label": "旅行",
+      "keywords": ["travel", "traveler", "travelling", "destination", "road trip", "van life", "旅行", "旅游", "旅拍", "自驾", "房车"]
+    },
+    {
+      "label": "美食/烹饪",
+      "keywords": ["cooking", "recipe", "food", "kitchen", "chef", "baking", "美食", "烹饪", "食谱", "料理", "烘焙"]
+    },
+    {
+      "label": "汽车/摩托",
+      "keywords": ["automotive", "car", "cars", "motorcycle", "motorbike", "truck", "offroad", "汽车", "摩托", "机车", "越野车", "改装车"]
+    },
+    {
+      "label": "摄影/影像",
+      "keywords": ["photography", "photographer", "filmmaking", "videography", "camera", "lens", "photo", "摄影", "摄像", "相机", "镜头", "影像"]
+    },
+    {
+      "label": "游戏",
+      "keywords": ["gaming", "gamer", "gameplay", "esports", "video game", "游戏", "电竞", "实况"]
+    },
+    {
+      "label": "泛生活",
+      "keywords": ["lifestyle", "daily life", "life vlog", "personal vlog", "生活方式", "日常生活", "生活记录"]
+    }
+  ],
+  "content_types": [
+    {
+      "label": "产品测评",
+      "keywords": ["review", "reviewed", "hands-on", "test", "testing", "long term", "测评", "评测", "实测", "体验报告"]
+    },
+    {
+      "label": "开箱",
+      "keywords": ["unboxing", "unbox", "first look", "开箱", "拆箱", "上手"]
+    },
+    {
+      "label": "对比榜单",
+      "keywords": ["versus", " vs ", "comparison", "compare", "best of", "top 5", "top 10", "ranking", "对比", "横评", "排行榜", "推荐清单"]
+    },
+    {
+      "label": "教程",
+      "keywords": ["tutorial", "how to", "guide", "tips", "beginner", "step by step", "教程", "教学", "指南", "技巧", "入门"]
+    },
+    {
+      "label": "Vlog",
+      "keywords": ["vlog", "day in my life", "behind the scenes", "日常", "记录", "幕后"]
+    },
+    {
+      "label": "新闻资讯",
+      "keywords": ["news", "update", "industry", "explained", "资讯", "新闻", "行业动态", "解读"]
+    },
+    {
+      "label": "访谈",
+      "keywords": ["interview", "podcast", "conversation", "q&a", "访谈", "采访", "播客", "问答"]
+    }
+  ],
+  "entity_types": {
+    "品牌官方": ["official brand", "official channel", "company channel", "shop our", "our products", "品牌官方", "官方频道", "官方账号"],
+    "媒体机构": ["magazine", "publication", "media network", "news network", "editorial team", "杂志", "媒体机构", "编辑部"],
+    "家庭/多人": ["family channel", "our family", "couple channel", "husband and wife", "brothers", "sisters", "家庭频道", "我们一家", "夫妻", "兄弟", "姐妹"],
+    "团队": ["our team", "team of", "production team", "creator collective", "我们的团队", "制作团队", "创作团队"],
+    "个人创作者": ["i'm ", "i am ", "my name is ", "this is ", "my channel", "i make ", "i create ", "i review ", "i test ", "i share ", "i help ", "我是", "我叫", "我的频道", "我会分享"]
+  },
+  "own_brand": {
+    "strong": ["founder of", "co-founder of", "cofounder of", "owner of", "my brand", "our brand", "i founded", "we founded", "自有品牌", "我的品牌", "我们的品牌", "我创立", "我们创立", "品牌创始人"],
+    "weak": ["my shop", "our shop", "shop my", "shop our", "my products", "our products", "official store", "我的商店", "我们的商店", "自营店", "自家产品"],
+    "non_ownership": ["sponsored by", "affiliate", "affiliate link", "discount code", "use code", "brand partner", "赞助", "联盟链接", "折扣码", "品牌合作"]
+  }
+}
