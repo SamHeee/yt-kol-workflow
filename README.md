@@ -4,6 +4,34 @@
 
 ## 快速开始
 
+### 工作流使用教程（新手推荐）
+
+> 如果你是首次使用，请按以下步骤操作：
+
+1. **克隆项目** - 在 Agent 对话框输入：
+   ```
+   把 https://github.com/SamHeee/yt-kol-workflow 安装到 E:\（请自行填写你的文件夹路径）
+   ```
+
+2. **创建配置文件** - 在 Agent 对话框输入：
+   ```
+   参考项目文件创建 .env 和 keyword.txt 文件
+   ```
+
+3. **配置 YouTube API** - 手动打开 `.env` 文件，输入你的 YouTube API 密钥并保存。
+   > 需要提前用 Gmail 邮箱自行获取免费 API 密钥（可咨询 AI 获取帮助）
+
+4. **设置搜索关键词并启动** - 在 Agent 对话框输入：
+   ```
+   我的搜索关键词是 surefire/surefire flashlight，帮我更新到 keyword.txt。更新完成后启动工作流
+   ```
+
+5. **同步飞书（可选）** - 如需打通飞书，在 Agent 对话框输入：
+   ```
+   同步数据到飞书文档
+   ```
+   Agent 会自动进行飞书 CLI 授权、创建新多维表格，最后同步完整的数据。
+
 ### 1. 安装依赖
 
 ```bash
@@ -140,7 +168,7 @@ python main.py quota
 python main.py feishu-setup
 ```
 
-该命令可在搜索前独立完成 lark-cli 检测或自动安装、命名 profile、浏览器应用创建和 Base OAuth 授权。若未提供 Base URL 或 `FEISHU_APP_TOKEN`，设置流程会自动创建一个名为 `FEISHU_BASE_NAME`（默认 `KOL网红开发工作流`）的 Base，并在本地保存后续运行所需的目标信息。OAuth 凭证由 lark-cli 存入系统钥匙串，不写入 `.env`。
+该命令可在搜索前独立完成 lark-cli 检测或自动安装、命名 profile、浏览器应用创建和 Base OAuth 授权。若未提供 Base URL 或 `FEISHU_APP_TOKEN`，设置流程会自动创建一个名为 `FEISHU_BASE_NAME`（默认 `KOL_CRM_`）的 Base，并在本地保存后续运行所需的目标信息。OAuth 凭证由 lark-cli 存入系统钥匙串，不写入 `.env`。
 
 ### 数据汇总与飞书维护
 
@@ -251,16 +279,6 @@ python main.py refresh-influencers --fields name --replace-kol-names
 lark-cli 的 OAuth 凭证保存在操作系统钥匙串，不写入 `.env`；本地保存的 Base 目标不等同于 OAuth 凭证。企业安全策略可能要求管理员审批应用或权限，自动流程无法绕过组织审批。
 
 维护命令使用 `--dry-run` 时不会新建 Base；如果既没有显式目标也没有本地已保存目标，程序会提示先运行 `python main.py feishu-setup`。
-
-### 单账户配置
-
-项目不再支持 Sam/work 多账号切换。历史环境变量需要迁移到无后缀变量：
-
-| 旧变量 | 新变量 |
-|---------|------|
-| `FEISHU_APP_ID_Sam` / `FEISHU_APP_ID_work` | `FEISHU_APP_ID` |
-| `FEISHU_APP_SECRET_Sam` / `FEISHU_APP_SECRET_work` | `FEISHU_APP_SECRET` |
-| `FEISHU_APP_TOKEN_Sam` / `FEISHU_APP_TOKEN_work` | `FEISHU_APP_TOKEN` |
 
 ### 飞书预检
 
