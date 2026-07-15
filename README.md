@@ -23,7 +23,7 @@
 
 4. **设置搜索关键词并启动** - 在 Agent 对话框输入：
    ```
-   我的搜索关键词是 surefire/surefire flashlight，帮我更新到 keyword.txt。更新完成后启动工作流
+   我的搜索关键词是 xxx/xxx，帮我更新到 keyword.txt。更新完成后启动工作流
    ```
 
 5. **同步飞书（可选）** - 如需打通飞书，在 Agent 对话框输入：
