@@ -115,7 +115,14 @@ def test_setup_parser_exposes_read_only_plan_and_minimal_scope():
 def test_full_setup_dry_run_plans_without_preflight_writes(monkeypatch, capsys):
     parser = workflow_main.build_parser()
     args = parser.parse_args(
-        ["feishu-setup", "--feishu-auth-mode", "cli", "--dry-run"]
+        [
+            "feishu-setup",
+            "--feishu-auth-mode",
+            "cli",
+            "--feishu-app-token",
+            "bascn_test",
+            "--dry-run",
+        ]
     )
     context_calls = []
     fake_context = SimpleNamespace(
