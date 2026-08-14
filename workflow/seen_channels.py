@@ -4,11 +4,39 @@
 
 import json
 import logging
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, Set
 
 logger = logging.getLogger("kol_workflow.workflow.seen_channels")
+
+
+DEFAULT_STATE_ROOT = Path.home() / ".kol_workflow" / "seen_channels"
+
+
+def default_seen_channels_path(
+    *,
+    cli_profile: str = "kol-workflow",
+    app_token: str = "",
+    root: Path = DEFAULT_STATE_ROOT,
+) -> Path:
+    """Return an isolated, non-secret channel-state path for one Base target.
+
+    The resource token is never written into the path.  A short SHA-256 digest
+    keeps separate Base targets from sharing incremental-deduplication history,
+    while the sanitized profile name makes the directory understandable to a
+    local operator.  Before a Base target is known, the profile-only ``local``
+    namespace is used.
+    """
+
+    profile = "".join(
+        character if character.isalnum() or character in {"-", "_"} else "_"
+        for character in str(cli_profile or "kol-workflow").strip()
+    ).strip("_") or "kol-workflow"
+    token = str(app_token or "").strip()
+    target_key = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16] if token else "local"
+    return Path(root).expanduser() / profile / f"{target_key}.json"
 
 
 class SeenChannelStore:

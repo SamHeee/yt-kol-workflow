@@ -224,23 +224,48 @@ def test_video_created_time_schema_and_formatter_are_system_managed():
     assert "多行文本" not in fields
 
 
-def test_schema_ensures_activity_single_select_options():
+def test_schema_ensures_controlled_single_select_options_and_preserves_ids():
     class FakeClient:
         def __init__(self):
-            self.updated = None
+            self.updated = {}
 
         def list_fields(self, table_id):
-            return [{
-                "field_id": "fld1",
-                "field_name": "断更评估",
-                "type": 3,
-                "property": {"options": []},
-            }]
+            return [
+                {
+                    "field_id": "fld1",
+                    "field_name": "断更评估",
+                    "type": 3,
+                    "property": {"options": []},
+                },
+                {
+                    "field_id": "fld2",
+                    "field_name": "开发状态",
+                    "type": 3,
+                    "property": {
+                        "options": [
+                            {"id": "opt_wait", "name": "待联系", "color": 0},
+                            {"id": "opt_coop", "name": "进入合作", "color": 7},
+                            {"id": "opt_custom", "name": "暂停跟进", "color": 8},
+                        ]
+                    },
+                },
+            ]
 
         def update_field(self, table_id, field_id, name, field_type, property):
-            self.updated = property
+            self.updated[name] = property
 
     client = FakeClient()
     ensure_influencer_field_options(client, "tbl1")
 
-    assert [item["name"] for item in client.updated["options"]] == INFLUENCERS_FIELD_OPTIONS["断更评估"]
+    activity_options = client.updated["断更评估"]["options"]
+    assert [item["name"] for item in activity_options] == INFLUENCERS_FIELD_OPTIONS["断更评估"]
+
+    development_options = client.updated["开发状态"]["options"]
+    assert [item["name"] for item in development_options] == [
+        *INFLUENCERS_FIELD_OPTIONS["开发状态"],
+        "暂停跟进",
+    ]
+    by_name = {item["name"]: item for item in development_options}
+    assert by_name["待联系"]["id"] == "opt_wait"
+    assert by_name["进入合作"]["id"] == "opt_coop"
+    assert by_name["暂停跟进"]["id"] == "opt_custom"

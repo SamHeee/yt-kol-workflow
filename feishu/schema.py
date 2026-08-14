@@ -100,6 +100,7 @@ INFLUENCERS_FIELDS = [
 
 INFLUENCERS_FIELD_OPTIONS = {
     "断更评估": ["持续更新", "有断更风险", "待确认"],
+    "开发状态": ["待联系", "已发邮件待回复", "已读不回", "不感兴趣", "进入合作"],
 }
 
 INFLUENCER_VIDEOS_TABLE = "网红视频表"
@@ -176,16 +177,30 @@ def ensure_influencer_field_options(client: BitableClient, table_id: str) -> Non
             continue
         property_data = dict(field.get("property") or {})
         options = list(property_data.get("options") or [])
-        existing_names = {str(option.get("name", "")) for option in options}
-        missing_names = [name for name in required_names if name not in existing_names]
-        if not missing_names:
-            continue
+        required_set = set(required_names)
+        existing_by_name = {
+            str(option.get("name", "")): option
+            for option in options
+            if str(option.get("name", "")) in required_set
+        }
         start_color = len(options)
-        options.extend(
-            {"name": name, "color": (start_color + index) % 54}
-            for index, name in enumerate(missing_names)
-        )
-        property_data["options"] = options
+        missing_count = 0
+        required_options = []
+        for name in required_names:
+            option = existing_by_name.get(name)
+            if option is None:
+                option = {"name": name, "color": (start_color + missing_count) % 54}
+                missing_count += 1
+            required_options.append(option)
+        unmanaged_options = [
+            option
+            for option in options
+            if str(option.get("name", "")) not in required_set
+        ]
+        target_options = required_options + unmanaged_options
+        if target_options == options:
+            continue
+        property_data["options"] = target_options
         client.update_field(
             table_id,
             field.get("field_id", ""),

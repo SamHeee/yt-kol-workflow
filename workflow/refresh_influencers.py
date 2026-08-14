@@ -8,7 +8,6 @@ import logging
 import math
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Set
-from urllib.parse import parse_qs, urlparse
 
 from feishu.bitable import BitableClient
 from feishu.value_utils import field_to_text
@@ -18,7 +17,7 @@ from filter.email_extractor import extract_email
 from filter.kol_name_extractor import extract_kol_name
 from youtube.channels import fetch_channel_details
 from youtube.playlists import get_channel_uploads
-from youtube.videos import fetch_video_details
+from youtube.videos import extract_video_id, fetch_video_details
 
 
 logger = logging.getLogger("kol_workflow.workflow.refresh_influencers")
@@ -94,7 +93,7 @@ def refresh_influencers(
     if records and "rep-title" in selected:
         rep_ids = []
         for record in records:
-            video_id = _video_id_from_url(
+            video_id = extract_video_id(
                 field_to_text((record.get("fields") or {}).get("代表视频URL"))
             )
             if video_id and video_id not in rep_ids:
@@ -178,7 +177,7 @@ def refresh_influencers(
             )
 
         if "rep-title" in selected:
-            rep_id = _video_id_from_url(field_to_text(existing.get("代表视频URL")))
+            rep_id = extract_video_id(field_to_text(existing.get("代表视频URL")))
             title = representative_titles.get(rep_id, "")
             if title:
                 update_fields["代表视频标题"] = title
@@ -230,7 +229,7 @@ def _estimate_quota(records: Sequence[Dict[str, Any]], selected: Set[str]) -> in
         cost += count * 2  # playlistItems.list + videos.list per channel
     if "rep-title" in selected:
         representative_ids = {
-            _video_id_from_url(field_to_text((record.get("fields") or {}).get("代表视频URL")))
+            extract_video_id(field_to_text((record.get("fields") or {}).get("代表视频URL")))
             for record in records
         }
         representative_ids.discard("")
@@ -241,25 +240,3 @@ def _estimate_quota(records: Sequence[Dict[str, Any]], selected: Set[str]) -> in
 def _utc_timestamp_ms(value: str) -> int:
     parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
     return int(parsed.timestamp() * 1000)
-
-
-def _video_id_from_url(value: str) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    if "/" not in text and "?" not in text and len(text) == 11:
-        return text
-    try:
-        parsed = urlparse(text)
-    except ValueError:
-        return ""
-    host = parsed.netloc.lower().split(":", 1)[0]
-    if host in {"youtu.be", "www.youtu.be"}:
-        return parsed.path.strip("/").split("/", 1)[0]
-    if host.endswith("youtube.com"):
-        if parsed.path == "/watch":
-            return (parse_qs(parsed.query).get("v") or [""])[0]
-        parts = [part for part in parsed.path.split("/") if part]
-        if len(parts) >= 2 and parts[0] in {"shorts", "live", "embed"}:
-            return parts[1]
-    return ""

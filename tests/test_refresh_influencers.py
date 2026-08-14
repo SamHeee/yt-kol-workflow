@@ -124,9 +124,9 @@ def test_explicit_migration_flag_can_replace_program_generated_name(monkeypatch)
 
 
 def test_video_id_parser_supports_common_youtube_urls():
-    assert refresh_module._video_id_from_url("https://www.youtube.com/watch?v=abcdefghijk") == "abcdefghijk"
-    assert refresh_module._video_id_from_url("https://youtu.be/abcdefghijk") == "abcdefghijk"
-    assert refresh_module._video_id_from_url("https://www.youtube.com/shorts/abcdefghijk") == "abcdefghijk"
+    assert refresh_module.extract_video_id("https://www.youtube.com/watch?v=abcdefghijk") == "abcdefghijk"
+    assert refresh_module.extract_video_id("https://youtu.be/abcdefghijk") == "abcdefghijk"
+    assert refresh_module.extract_video_id("https://www.youtube.com/shorts/abcdefghijk") == "abcdefghijk"
 
 
 def test_quota_estimate_uses_batched_channel_and_representative_calls():

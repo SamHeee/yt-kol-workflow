@@ -34,6 +34,7 @@ class BaseTarget:
     name: str = ""
     auth_mode: str = "cli"
     created_at: str = ""
+    pending_view_tables: tuple[str, ...] = ()
 
 
 @dataclass
@@ -44,16 +45,25 @@ class FeishuClientContext:
     base_url: str = ""
     base_name: str = ""
     created_base: bool = False
+    initial_table_name: str = ""
+    pending_view_tables: tuple[str, ...] = ()
+    target_store: Optional[Path] = None
     cli_manager: Any = None
 
 
 def extract_app_token(url_or_token: str) -> str:
-    """Extract a Base token while retaining compatibility with old inputs."""
+    """Extract only genuine Base tokens, never Wiki node tokens."""
     value = (url_or_token or "").strip()
     if not value:
         return ""
-    match = re.search(r"/(?:base|wiki)/([A-Za-z0-9_-]+)", value)
-    return match.group(1) if match else value
+    match = re.search(r"/base/([A-Za-z0-9_-]+)", value, flags=re.IGNORECASE)
+    if match:
+        return match.group(1)
+    if re.match(r"^https?://", value, flags=re.IGNORECASE) or re.search(
+        r"/wiki/", value, flags=re.IGNORECASE
+    ):
+        return ""
+    return value
 
 
 def create_bitable_client(
@@ -84,14 +94,26 @@ def create_bitable_client(
 
     store_path = Path(target_store or DEFAULT_TARGET_STORE).expanduser()
     supplied_value = (app_token or "").strip()
-    supplied_url = supplied_value if supplied_value.startswith(("https://", "http://")) else ""
+    supplied_url = (
+        supplied_value
+        if re.match(r"^https?://", supplied_value, flags=re.IGNORECASE)
+        else ""
+    )
     token = extract_app_token(supplied_value)
-    stored = None if token else load_base_target(cli_profile, store_path)
+    # An explicitly supplied URL must win for target selection.  Still load
+    # persisted metadata so a retry that names the same Base can retain its
+    # crash-recovery journal (for example pending default-view setup).
+    persisted = load_base_target(cli_profile, store_path)
+    stored = None if supplied_value else persisted
     if stored:
         token = stored.app_token
 
     if mode == "auto":
         if stored and stored.auth_mode == "cli":
+            mode = "cli"
+        elif supplied_url and not token:
+            # Wiki/share URLs require the CLI resolver and can never be used as
+            # app tokens, even when legacy app credentials are also present.
             mode = "cli"
         elif token and app_id and app_secret:
             mode = "app"
@@ -99,6 +121,10 @@ def create_bitable_client(
             mode = "cli"
 
     if mode == "app":
+        if supplied_url and not token:
+            raise RuntimeError(
+                "飞书 App 模式不能把 Wiki/分享链接当作 app_token；请改用 CLI 模式解析 URL"
+            )
         missing = []
         if not token:
             missing.append("app_token")
@@ -139,10 +165,32 @@ def create_bitable_client(
     created_base = False
     base_url = supplied_url or (stored.url if stored else "")
     actual_name = (stored.name if stored and stored.name else base_name)
-    if not token:
+    if supplied_url:
+        resolver = getattr(manager, "resolve_base_url", None)
+        if not callable(resolver):
+            raise RuntimeError("飞书 CLI 管理器不支持解析 Base/Wiki URL")
+        resolved = resolver(supplied_url)
+        target = _coerce_created_target(resolved, default_name=base_name)
+        token = target.app_token
+        base_url = target.url or supplied_url
+        actual_name = target.name or base_name
+    elif not token:
         if not create_base_if_missing:
             raise RuntimeError("未提供飞书 Base URL/app_token，且已禁止自动创建多维表格")
-        created = manager.create_base(base_name)
+        from .full_schema import FULL_SCHEMA
+
+        first_table = FULL_SCHEMA.tables[0]
+        try:
+            created = manager.create_base(
+                base_name,
+                table_name=first_table.name,
+                fields=[first_table.fields[0].cli_json()],
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "飞书 Base 创建或首表初始化失败。官方 CLI 可能已经创建了一个未保存到本地的 Base；"
+                "请先在飞书中按名称检查，避免直接重试产生重复 Base。"
+            ) from exc
         target = _coerce_created_target(created, default_name=base_name)
         token = target.app_token
         base_url = target.url
@@ -152,15 +200,31 @@ def create_bitable_client(
     if not token:
         raise RuntimeError("飞书 CLI 未返回可用的 Base app_token")
 
+    matching_stored = (
+        persisted
+        if persisted is not None and persisted.app_token == token
+        else None
+    )
+    if matching_stored:
+        base_url = base_url or matching_stored.url
+        actual_name = matching_stored.name or actual_name
+
+    from .full_schema import FULL_SCHEMA
+
     target = BaseTarget(
         app_token=token,
         url=base_url,
         name=actual_name,
         auth_mode="cli",
         created_at=(
-            stored.created_at
-            if stored and not created_base
+            matching_stored.created_at
+            if matching_stored and not created_base
             else datetime.now(timezone.utc).isoformat()
+        ),
+        pending_view_tables=(
+            tuple(table.name for table in FULL_SCHEMA.tables)
+            if created_base
+            else tuple(matching_stored.pending_view_tables if matching_stored else ())
         ),
     )
     save_base_target(cli_profile, target, store_path)
@@ -185,6 +249,13 @@ def create_bitable_client(
         base_url=base_url,
         base_name=actual_name,
         created_base=created_base,
+        initial_table_name=(
+            str(created.get("initial_table_name") or "")
+            if created_base and isinstance(created, dict)
+            else ""
+        ),
+        pending_view_tables=target.pending_view_tables,
+        target_store=store_path,
         cli_manager=manager,
     )
 
@@ -216,7 +287,11 @@ def create_bitable_client_from_config(
 
 
 def initialize_created_base_schema(context: FeishuClientContext) -> dict:
-    """Create the four business tables and remove a new Base's blank default table."""
+    """Legacy four-table bootstrap retained for ``--collection-only``.
+
+    Full seven-table setup owns its own phased provisioning and intentionally
+    does not call this helper before all metadata has been verified.
+    """
     if not context.created_base:
         return {}
 
@@ -262,6 +337,11 @@ def load_base_target(profile: str, path: Path = DEFAULT_TARGET_STORE) -> Optiona
             name=str(item.get("name") or ""),
             auth_mode=str(item.get("auth_mode") or "cli"),
             created_at=str(item.get("created_at") or ""),
+            pending_view_tables=tuple(
+                str(name)
+                for name in (item.get("pending_view_tables") or ())
+                if str(name)
+            ),
         )
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return None
@@ -274,6 +354,10 @@ def save_base_target(
 ) -> None:
     path = Path(path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
     payload = {"version": 1, "profiles": {}}
     try:
         current = json.loads(path.read_text(encoding="utf-8"))

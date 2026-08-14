@@ -39,6 +39,7 @@ def setup_logger(
     secrets: list = None,
 ) -> logging.Logger:
     """Create and configure the application logger."""
+    configured_level = getattr(logging, log_level.upper(), logging.INFO)
     log_path = Path(log_dir)
     log_path.mkdir(parents=True, exist_ok=True)
 
@@ -51,16 +52,17 @@ def setup_logger(
     # Remove existing handlers
     logger.handlers.clear()
 
-    # File handler - always DEBUG
+    # Persist only the configured verbosity. Debug diagnostics remain available
+    # when explicitly requested, but are not written by an INFO-level run.
     fh = logging.FileHandler(log_file, encoding="utf-8")
-    fh.setLevel(logging.DEBUG)
+    fh.setLevel(configured_level)
     fh.setFormatter(logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s - %(message)s"
     ))
 
     # Console handler - user-specified level
     ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+    ch.setLevel(configured_level)
     ch.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
 
     # Masking filter
