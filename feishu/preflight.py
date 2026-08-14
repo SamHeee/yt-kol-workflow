@@ -368,7 +368,9 @@ def _build_test_records(marker: str) -> Dict[str, List[dict]]:
                 "unique_channels": 1,
                 "new_channels": 1,
                 "quota_used": 0,
-                "status": "预检测试",
+                # Reuse a managed option so health checks do not permanently
+                # add a setup-only value to the single-select field.
+                "status": "成功",
                 "note": marker,
             })
         ],

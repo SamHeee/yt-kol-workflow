@@ -17,15 +17,17 @@ import os
 import argparse
 import json
 import logging
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Set
+from urllib.parse import urlsplit
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import (
-    WorkflowConfig, YouTubeConfig, FeishuConfig, BrandExclusion,
+    WorkflowConfig, YouTubeConfig, FeishuConfig, LogisticsConfig, BrandExclusion,
     parse_keywords_file, KeywordTask, PROJECT_ROOT,
 )
 from utils.logger import setup_logger, _to_rfc3339_boundary
@@ -37,10 +39,13 @@ from youtube.quota import (
 )
 from feishu.bitable import BitableClient
 from feishu.client_factory import (
+    BaseTarget,
     FeishuClientContext,
     create_bitable_client_from_config,
     initialize_created_base_schema,
+    load_base_target,
     mask_app_token,
+    save_base_target,
 )
 from feishu.preflight import run_feishu_preflight
 from feishu.schema import (
@@ -75,6 +80,17 @@ def _feishu_progress(message: str) -> None:
     print(f"[飞书] {message}")
 
 
+def _masked_feishu_url(value: str) -> str:
+    """Return only the origin so resource tokens never enter logs."""
+    try:
+        parsed = urlsplit(str(value or "").strip())
+    except ValueError:
+        return "<已脱敏>"
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}/…"
+    return "<已脱敏>"
+
+
 def _create_feishu_context(
     config: FeishuConfig,
     *,
@@ -90,10 +106,163 @@ def _create_feishu_context(
     if context.created_base:
         print(f"[飞书] 已自动创建多维表格: {context.base_name}")
     if context.base_url:
-        print(f"[飞书] 多维表格: {context.base_url}")
+        print(f"[飞书] 多维表格: {_masked_feishu_url(context.base_url)}")
     else:
         print(f"[飞书] Base token: {mask_app_token(context.app_token)}（已保存供后续复用）")
     return context
+
+
+def _bind_workflow_feishu_target(config: WorkflowConfig, context: FeishuClientContext) -> None:
+    """Keep implicit channel-dedupe state isolated per resolved Base target."""
+
+    config.bind_feishu_target(context.app_token)
+
+
+def _ensure_full_feishu_workspace(
+    context: FeishuClientContext,
+    config: FeishuConfig,
+    *,
+    dry_run: bool = False,
+    enable_workflow: bool = True,
+):
+    """Provision and health-check a complete CLI workspace before automation.
+
+    The native Workflow is deliberately kept disabled until the established
+    four collection tables have passed their record-level write/read/delete
+    preflight.  This prevents a partially verified setup from accepting live
+    status-change triggers.
+    """
+
+    if context.auth_mode != "cli":
+        return None
+    ensure_scopes = getattr(context.cli_manager, "ensure_full_workspace_scopes", None)
+    scopes_valid = getattr(context.cli_manager, "full_workspace_scopes_valid", None)
+    if dry_run or not config.auto_setup:
+        if callable(scopes_valid) and not scopes_valid():
+            raise RuntimeError(
+                "当前 lark-cli Profile 缺少完整 Workflow 权限；"
+                + (
+                    "自动设置已禁用，无法发起浏览器补授权"
+                    if not config.auto_setup
+                    else "请先运行 python main.py feishu-setup 完成补授权"
+                )
+            )
+    elif callable(ensure_scopes):
+        ensure_scopes()
+    from feishu.lark_cli_base import LarkCliBaseRunner
+    from feishu.provisioning import SevenTableProvisioner
+
+    admin = LarkCliBaseRunner(
+        base_token=context.app_token,
+        profile=config.cli_profile,
+        cli_path=getattr(context.cli_manager, "cli_path", "") or config.cli_path or "lark-cli",
+        timeout=min(max(config.auth_timeout_seconds, 30), 300),
+    )
+    capability = admin.probe_capabilities()
+    if not capability.supported:
+        raise RuntimeError(
+            "当前 lark-cli 缺少完整七表 setup 所需命令: "
+            + ", ".join(capability.missing_commands)
+        )
+    def _journal_pending_views(table_names):
+        if dry_run or not table_names:
+            return
+        from feishu.full_schema import FULL_SCHEMA
+
+        managed_names = {table.name for table in FULL_SCHEMA.tables}
+        additions = tuple(name for name in table_names if name in managed_names)
+        if not additions:
+            return
+        target_store = getattr(context, "target_store", None)
+        existing = (
+            load_base_target(config.cli_profile, target_store)
+            if target_store
+            else load_base_target(config.cli_profile)
+        )
+        pending = tuple(
+            dict.fromkeys(
+                tuple(getattr(context, "pending_view_tables", ()) or ()) + additions
+            )
+        )
+        if existing and existing.app_token == context.app_token:
+            target = replace(existing, pending_view_tables=pending)
+        else:
+            target = BaseTarget(
+                app_token=context.app_token,
+                url=context.base_url,
+                name=context.base_name,
+                auth_mode="cli",
+                pending_view_tables=pending,
+            )
+        if target_store:
+            save_base_target(config.cli_profile, target, target_store)
+        else:
+            save_base_target(config.cli_profile, target)
+        context.pending_view_tables = pending
+
+    provisioner = SevenTableProvisioner(admin)
+    result = provisioner.apply(
+        dry_run=dry_run,
+        # Existing verified workflows retain their state.  Newly created or
+        # currently disabled workflows remain disabled until preflight below.
+        enable_workflow=(enable_workflow if dry_run else False),
+        initialize_view_tables=(
+            tuple(getattr(context, "pending_view_tables", ()) or ())
+            if not dry_run
+            else ()
+        ),
+        journal_pending_views=_journal_pending_views,
+    )
+    if dry_run:
+        return result
+
+    preflight_client, schema_manager = run_feishu_preflight(client=context.client)
+    result.preflight_client = preflight_client
+    result.schema_manager = schema_manager
+    if enable_workflow and not result.workflow_enabled:
+        # The provisioner compensates only when this exact enable write
+        # succeeded but its status readback failed.  Earlier validation errors
+        # never alter a pre-existing Workflow's state.
+        result.workflow_id, result.workflow_enabled = provisioner.ensure_workflow_enabled()
+
+    pending_view_tables = tuple(
+        dict.fromkeys(
+            tuple(getattr(context, "pending_view_tables", ()) or ())
+            + tuple(getattr(result, "pending_view_tables", ()) or ())
+        )
+    )
+    if pending_view_tables:
+        from feishu.full_schema import FULL_SCHEMA
+
+        target_store = getattr(context, "target_store", None)
+        existing = (
+            load_base_target(config.cli_profile, target_store)
+            if target_store
+            else load_base_target(config.cli_profile)
+        )
+        completed_views = set(result.initialized_view_tables)
+        managed_view_names = {table.name for table in FULL_SCHEMA.tables}
+        remaining_views = tuple(
+            name
+            for name in pending_view_tables
+            if name in managed_view_names and name not in completed_views
+        )
+        if existing and existing.app_token == context.app_token:
+            target = replace(existing, pending_view_tables=remaining_views)
+        else:
+            target = BaseTarget(
+                app_token=context.app_token,
+                url=context.base_url,
+                name=context.base_name,
+                auth_mode="cli",
+                pending_view_tables=remaining_views,
+            )
+        if target_store:
+            save_base_target(config.cli_profile, target, target_store)
+        else:
+            save_base_target(config.cli_profile, target)
+        context.pending_view_tables = remaining_views
+    return result
 
 
 def _ensure_created_base_schema(context: FeishuClientContext) -> None:
@@ -779,10 +948,16 @@ def run_batch(
     if write_feishu:
         try:
             context = _create_feishu_context(config.feishu)
-            _ensure_created_base_schema(context)
-            feishu_client, schema_mgr = run_feishu_preflight(
-                client=context.client,
-            )
+            _bind_workflow_feishu_target(config, context)
+            full_result = _ensure_full_feishu_workspace(context, config.feishu)
+            if full_result is None:
+                _ensure_created_base_schema(context)
+                feishu_client, schema_mgr = run_feishu_preflight(
+                    client=context.client,
+                )
+            else:
+                feishu_client = full_result.preflight_client
+                schema_mgr = full_result.schema_manager
             logger.info("飞书多维表格初始化完成")
         except Exception as e:
             logger.error(f"飞书预检失败: {e}")
@@ -989,13 +1164,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp_feishu_setup.add_argument(
         "--feishu-app-token",
-        default=os.environ.get("FEISHU_APP_TOKEN", ""),
+        default="",
         help="已有飞书 Base URL/app_token；不填则自动创建新的多维表格",
     )
     sp_feishu_setup.add_argument(
         "--no-create-base",
         action="store_true",
         help="只完成 CLI 授权，不创建新的多维表格",
+    )
+    sp_feishu_setup.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只读盘点目标 Base 并输出七表/Workflow 变更计划；没有目标时不创建 Base",
+    )
+    sp_feishu_setup.add_argument(
+        "--no-enable-automation",
+        action="store_true",
+        help="创建并校验首次合作 Workflow，但保持禁用",
+    )
+    sp_feishu_setup.add_argument(
+        "--collection-only",
+        action="store_true",
+        help="兼容旧行为：仅准备四张采集表，不创建运营表或 Workflow",
     )
     _add_feishu_auth_args(sp_feishu_setup)
 
@@ -1083,6 +1273,96 @@ def build_parser() -> argparse.ArgumentParser:
     sp_refresh.add_argument("--stats", default="", help="统计 JSON 输出路径")
     _add_feishu_auth_args(sp_refresh)
 
+    # ---- refresh-cooperation-content ----
+    sp_content = subparsers.add_parser(
+        "refresh-cooperation-content",
+        help="通过 YouTube API 刷新合作内容数据表中已有记录的视频数据",
+    )
+    sp_content.add_argument(
+        "--feishu-app-token",
+        default=os.environ.get("FEISHU_APP_TOKEN", ""),
+        help="飞书 Base/Wiki URL 或 app_token（可读取 FEISHU_APP_TOKEN）",
+    )
+    sp_content.add_argument(
+        "--youtube-api-key",
+        default=os.environ.get("YOUTUBE_API_KEY", ""),
+        help="YouTube API Key（可读取 YOUTUBE_API_KEY）",
+    )
+    sp_content.add_argument(
+        "--content-record-id",
+        action="append",
+        default=[],
+        help="只刷新指定内容记录ID，可重复传入",
+    )
+    sp_content.add_argument("--limit", type=int, default=None, help="最多处理的候选记录数")
+    sp_content.add_argument(
+        "--max-age-hours",
+        type=float,
+        default=24,
+        help="成功数据超过多少小时后刷新（默认 24）",
+    )
+    sp_content.add_argument("--force", action="store_true", help="忽略新鲜度并强制刷新")
+    sp_content.add_argument("--dry-run", action="store_true", help="生成更新计划但不写飞书")
+    sp_content.add_argument("--stats", default="", help="统计 JSON 输出路径")
+    _add_feishu_auth_args(sp_content)
+
+    # ---- refresh-sample-logistics ----
+    sp_logistics = subparsers.add_parser(
+        "refresh-sample-logistics",
+        help="通过 17TRACK 刷新样品跟踪表中已寄出包裹的最新物流进度",
+    )
+    sp_logistics.add_argument(
+        "--feishu-app-token",
+        default=os.environ.get("FEISHU_APP_TOKEN", ""),
+        help="飞书 Base/Wiki URL 或 app_token（可读取 FEISHU_APP_TOKEN）",
+    )
+    sp_logistics.add_argument(
+        "--sample-record-id",
+        action="append",
+        default=[],
+        help="只刷新指定样品记录ID，可重复传入",
+    )
+    sp_logistics.add_argument("--limit", type=int, default=None, help="最多处理的候选记录数")
+    sp_logistics.add_argument(
+        "--max-age-hours",
+        type=float,
+        default=20,
+        help="成功查询超过多少小时后再次刷新（默认 20）",
+    )
+    sp_logistics.add_argument("--force", action="store_true", help="忽略新鲜度并强制刷新")
+    sp_logistics.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="仅生成候选计划；不调用物流 API、不注册运单、不写飞书",
+    )
+    sp_logistics.add_argument("--stats", default="", help="脱敏统计 JSON 输出路径")
+    _add_feishu_auth_args(sp_logistics)
+
+    # ---- dispatch-sample-reminders ----
+    sp_reminders = subparsers.add_parser(
+        "dispatch-sample-reminders",
+        help="汇总并发送样品送达次日或连续三天无进度的飞书私信提醒",
+    )
+    sp_reminders.add_argument(
+        "--feishu-app-token",
+        default=os.environ.get("FEISHU_APP_TOKEN", ""),
+        help="飞书 Base/Wiki URL 或 app_token（可读取 FEISHU_APP_TOKEN）",
+    )
+    sp_reminders.add_argument(
+        "--sample-record-id",
+        action="append",
+        default=[],
+        help="只检查指定样品记录ID，可重复传入",
+    )
+    sp_reminders.add_argument("--limit", type=int, default=None, help="最多处理的待提醒记录数")
+    sp_reminders.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只生成提醒计划，不更新提醒状态、不发送私信",
+    )
+    sp_reminders.add_argument("--stats", default="", help="脱敏统计 JSON 输出路径")
+    _add_feishu_auth_args(sp_reminders)
+
     return parser
 
 
@@ -1111,7 +1391,7 @@ def _add_common_args(parser):
     parser.add_argument("--estimated-channels", type=int, default=15,
                         help="配额预算: 每个关键词预计新增频道数 (默认15)")
     parser.add_argument("--seen-channels-file", default=os.environ.get("SEEN_CHANNELS_FILE", ""),
-                        help="跨运行持久频道库路径 (默认项目目录 seen_channels.json)")
+                        help="跨运行持久频道库路径（默认按 CLI profile 和 Base 隔离到 ~/.kol_workflow/seen_channels/）")
     parser.add_argument("--video-duration", choices=["any", "short", "medium", "long"], default="any",
                         help="YouTube搜索过滤: 视频时长")
     parser.add_argument("--video-caption", choices=["any", "closedCaption", "none"], default="any",
@@ -1174,6 +1454,10 @@ def _feishu_config_from_args(args) -> FeishuConfig:
     """Build FeishuConfig consistently for every CLI entry point."""
     config = FeishuConfig()
     token_or_url = getattr(args, "feishu_app_token", "")
+    if getattr(args, "command", "") == "feishu-setup" and not token_or_url:
+        # setup chooses between this profile's persisted target and a new Base;
+        # an unrelated global FEISHU_APP_TOKEN must not silently retarget it.
+        config.app_token = ""
     if token_or_url:
         config.app_token = FeishuConfig.extract_app_token(token_or_url)
     config.auth_mode = getattr(args, "feishu_auth_mode", config.auth_mode)
@@ -1258,6 +1542,15 @@ def main():
     if args.command == "refresh-influencers":
         handle_refresh_influencers(args)
         return
+    if args.command == "refresh-cooperation-content":
+        handle_refresh_cooperation_content(args)
+        return
+    if args.command == "refresh-sample-logistics":
+        handle_refresh_sample_logistics(args)
+        return
+    if args.command == "dispatch-sample-reminders":
+        handle_dispatch_sample_reminders(args)
+        return
 
     # ---- search / batch ----
     # Build config
@@ -1288,7 +1581,7 @@ def main():
     errors = config.validate(require_youtube=True, require_feishu=require_feishu)
     if errors:
         for err in errors:
-            print(f"❌ {err}")
+            print(f"[ERROR] {err}")
         sys.exit(1)
 
     # Setup logger
@@ -1317,7 +1610,7 @@ def handle_search(args, config: WorkflowConfig):
         keyword = args.keyword
         state = None
     else:
-        print("❌ 请指定 --keyword 或 --resume")
+        print("[ERROR] 请指定 --keyword 或 --resume")
         sys.exit(1)
 
     sort_order = args.sort_order or (state.data.get("sort_order", "") if state else "")
@@ -1330,10 +1623,16 @@ def handle_search(args, config: WorkflowConfig):
     if not args.no_feishu:
         try:
             context = _create_feishu_context(config.feishu)
-            _ensure_created_base_schema(context)
-            feishu_client, schema_mgr = run_feishu_preflight(
-                client=context.client,
-            )
+            _bind_workflow_feishu_target(config, context)
+            full_result = _ensure_full_feishu_workspace(context, config.feishu)
+            if full_result is None:
+                _ensure_created_base_schema(context)
+                feishu_client, schema_mgr = run_feishu_preflight(
+                    client=context.client,
+                )
+            else:
+                feishu_client = full_result.preflight_client
+                schema_mgr = full_result.schema_manager
         except Exception as e:
             logger.error(f"飞书预检失败: {e}")
             if args.no_excel:
@@ -1418,8 +1717,26 @@ def handle_merge_output(args):
 
 
 def handle_feishu_setup(args):
-    """Install/authenticate lark-cli and optionally prepare the four tables."""
+    """Prepare either the legacy four-table scope or the complete workspace."""
     feishu_cfg = _feishu_config_from_args(args)
+    dry_run = bool(getattr(args, "dry_run", False))
+    if dry_run and getattr(args, "collection_only", False):
+        raise RuntimeError("--collection-only 暂不提供 dry-run；请使用完整七表 dry-run")
+    if dry_run and not feishu_cfg.app_token:
+        from feishu.client_factory import load_base_target
+        from feishu.full_schema import FULL_SCHEMA
+
+        stored = load_base_target(feishu_cfg.cli_profile)
+        if stored is None:
+            print("\n飞书完整工作区离线计划（只读，尚未解析目标 Base）:")
+            print(f"  - 新建 Base: {feishu_cfg.base_name}")
+            print(f"  - 创建或补齐: {len(FULL_SCHEMA.tables)} 张工作表")
+            print(f"  - 必需字段: {FULL_SCHEMA.field_count} 个")
+            print(f"  - Lookup: {FULL_SCHEMA.lookup_count} 个")
+            print("  - 不新增业务视图；只配置新表的默认表格视图")
+            print("  - 创建并校验首次合作 Workflow，最后启用")
+            print("  本次未创建 Base、表、字段、记录或 Workflow。")
+            return
     if args.no_create_base and not feishu_cfg.app_token:
         if feishu_cfg.auth_mode == "app":
             raise RuntimeError("App 模式只授权不建 Base 时仍需提供 --feishu-app-token")
@@ -1444,15 +1761,55 @@ def handle_feishu_setup(args):
 
     context = _create_feishu_context(
         feishu_cfg,
-        create_base_if_missing=not args.no_create_base,
+        create_base_if_missing=not args.no_create_base and not dry_run,
     )
-    _ensure_created_base_schema(context)
-    _, schema_mgr = run_feishu_preflight(client=context.client)
+    if getattr(args, "collection_only", False):
+        if dry_run:
+            raise RuntimeError("--collection-only 暂不提供 dry-run；请使用完整七表 dry-run")
+        _ensure_created_base_schema(context)
+        _, schema_mgr = run_feishu_preflight(client=context.client)
+        print("\n飞书设置完成:")
+        print(f"  认证模式: {context.auth_mode}")
+        print(f"  Profile: {feishu_cfg.cli_profile if context.auth_mode == 'cli' else '-'}")
+        print(f"  Base: {context.base_url or mask_app_token(context.app_token)}")
+        print(f"  业务表: {len(schema_mgr.table_ids)} 张（仅采集层）")
+        return
+
+    if context.auth_mode != "cli":
+        raise RuntimeError("完整七表 setup 仅支持 FEISHU_AUTH_MODE=cli；旧 App 模式请加 --collection-only")
+
+    result = _ensure_full_feishu_workspace(
+        context,
+        feishu_cfg,
+        dry_run=dry_run,
+        enable_workflow=not getattr(args, "no_enable_automation", False),
+    )
+
+    if dry_run:
+        print("\n飞书完整工作区变更计划（只读）:")
+        if not result.plan.actions:
+            print("  无变更：7 张表、141 个字段及首次合作 Workflow 已就绪")
+        for action in result.plan.actions:
+            detail = f"（{action.detail}）" if action.detail else ""
+            print(f"  - {action.kind}: {action.target}{detail}")
+        print(f"  预计变更: {result.plan.mutation_count} 项")
+        return
+
+    # The complete helper ran the established four-table record-level health
+    # check before it enabled the Workflow.  Operations tables are validated
+    # strictly as metadata and never receive mock business rows during setup.
+    schema_mgr = result.schema_manager
     print("\n飞书设置完成:")
     print(f"  认证模式: {context.auth_mode}")
     print(f"  Profile: {feishu_cfg.cli_profile if context.auth_mode == 'cli' else '-'}")
     print(f"  Base: {context.base_url or mask_app_token(context.app_token)}")
-    print(f"  业务表: {len(schema_mgr.table_ids)} 张")
+    print("  工作表: 7 张（setup 不新增业务视图）")
+    print("  必需字段: 141 个；Lookup: 9 个")
+    print(
+        "  首次合作自动建档: "
+        + ("已启用" if result.workflow_enabled else "已创建并保持禁用")
+    )
+    print(f"  四表数据写删预检: {len(schema_mgr.table_ids)} 张通过")
 
 
 def handle_sync_workbook(args):
@@ -1610,6 +1967,329 @@ def handle_refresh_influencers(args):
     print(f"  统计: {stats_path}")
 
 
+def handle_refresh_cooperation_content(args):
+    """Refresh YouTube metrics for existing cooperation-content records."""
+    from feishu.cooperation_content import (
+        COOPERATION_CONTENT_TABLE,
+        COOPERATION_TABLE,
+        SAMPLE_TRACKING_TABLE,
+        validate_cooperation_content_metadata,
+    )
+    from workflow.refresh_cooperation_content import refresh_cooperation_content
+
+    feishu_cfg = _feishu_config_from_args(args)
+    if feishu_cfg.auth_mode != "cli":
+        raise RuntimeError(
+            "合作内容刷新仅允许 FEISHU_AUTH_MODE=cli；不会降级为 App 凭证模式"
+        )
+
+    youtube_cfg = YouTubeConfig(api_key=args.youtube_api_key)
+    if not youtube_cfg.api_key:
+        raise RuntimeError("合作内容刷新缺少配置: YOUTUBE_API_KEY")
+    if args.max_age_hours < 0:
+        raise RuntimeError("--max-age-hours 不能小于 0")
+    if args.limit is not None and args.limit < 0:
+        raise RuntimeError("--limit 不能小于 0")
+
+    context = _create_feishu_context(
+        feishu_cfg,
+        create_base_if_missing=False,
+    )
+    if context.auth_mode != "cli":
+        raise RuntimeError("合作内容刷新未获得 lark-cli 用户身份客户端")
+
+    client = context.client
+    table_id = client.find_table_by_name(COOPERATION_CONTENT_TABLE)
+    if not table_id:
+        raise RuntimeError(f"飞书数据表不存在: {COOPERATION_CONTENT_TABLE}")
+    cooperation_table_id = client.find_table_by_name(COOPERATION_TABLE)
+    sample_table_id = client.find_table_by_name(SAMPLE_TRACKING_TABLE)
+    if not cooperation_table_id or not sample_table_id:
+        raise RuntimeError("合作内容刷新缺少合作红人表或样品跟踪表")
+    validate_cooperation_content_metadata(
+        client.list_fields(table_id),
+        cooperation_table_id=cooperation_table_id,
+        cooperation_fields=client.list_fields(cooperation_table_id),
+        sample_table_id=sample_table_id,
+        sample_fields=client.list_fields(sample_table_id),
+        # Operators may reorder columns for data-entry convenience. Runtime
+        # writes are field-name keyed, so retain every structural/lookup check
+        # without treating presentation order as unsafe schema drift.
+        strict_order=False,
+    )
+
+    quota_tracker = QuotaTracker(youtube_cfg.daily_quota)
+    result = refresh_cooperation_content(
+        api_key=youtube_cfg.api_key,
+        client=client,
+        table_id=table_id,
+        content_ids=args.content_record_id,
+        limit=args.limit,
+        stale_hours=args.max_age_hours,
+        force=args.force,
+        dry_run=args.dry_run,
+        quota_tracker=quota_tracker,
+    )
+    result["quota_used"] = quota_tracker.used
+    result["finished_at"] = datetime.now().isoformat(timespec="seconds")
+
+    stats_path = args.stats
+    if not stats_path:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stats_path = str(
+            PROJECT_ROOT
+            / "output"
+            / "content_refresh"
+            / f"cooperation_content_refresh_{stamp}.json"
+        )
+    Path(stats_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(stats_path).write_text(
+        json.dumps(result, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    print("\n合作内容刷新完成:")
+    print(f"  源记录: {result['source_records']}")
+    print(f"  候选记录: {result['candidate_records']}")
+    print(f"  API 批次: {result['api_batches']}")
+    print(f"  计划更新: {result['planned_updates']}")
+    print(f"  实际更新: {result['actual_updates']}")
+    print(f"  同步状态: {result['status_counts']}")
+    print(f"  跳过原因: {result['skipped_counts']}")
+    print(f"  记录级错误: {len(result['errors'])}")
+    print(f"  配额消耗: {result['quota_used']}")
+    print(f"  统计: {stats_path}")
+
+    if result.get("write_failures"):
+        raise RuntimeError(
+            f"合作内容刷新有 {result['write_failures']} 条飞书记录写入失败；详情见统计文件"
+        )
+    if result.get("errors"):
+        raise SystemExit(2)
+
+
+def _resolve_sample_tracking_table(client, configured_table_id: str = "") -> str:
+    """Resolve the approved sample table without creating or guessing a target."""
+    from feishu.sample_logistics import SAMPLE_TRACKING_TABLE
+
+    explicit_id = str(configured_table_id or "").strip()
+    if explicit_id:
+        tables = client.list_tables()
+        matched = next(
+            (
+                table
+                for table in tables
+                if str(table.get("table_id") or "").strip() == explicit_id
+            ),
+            None,
+        )
+        if not matched:
+            raise RuntimeError("SAMPLE_TRACKING_TABLE_ID 在目标 Base 中不存在")
+        if str(matched.get("name") or "").strip() != SAMPLE_TRACKING_TABLE:
+            raise RuntimeError(
+                f"SAMPLE_TRACKING_TABLE_ID 指向的不是“{SAMPLE_TRACKING_TABLE}”"
+            )
+        return explicit_id
+
+    table_id = client.find_table_by_name(SAMPLE_TRACKING_TABLE)
+    if not table_id:
+        raise RuntimeError(f"飞书数据表不存在: {SAMPLE_TRACKING_TABLE}")
+    return table_id
+
+
+def _write_sample_logistics_stats(
+    payload: dict,
+    *,
+    requested_path: str,
+    prefix: str,
+) -> str:
+    """Persist only the workflow's already-sanitized operational payload."""
+    stats_path = str(requested_path or "").strip()
+    if not stats_path:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stats_path = str(
+            PROJECT_ROOT
+            / "output"
+            / "sample_logistics"
+            / f"{prefix}_{stamp}.json"
+        )
+    path = Path(stats_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+def handle_refresh_sample_logistics(args):
+    """Refresh sample shipments through 17TRACK and the CLI-only Base client."""
+    from feishu.sample_logistics import validate_sample_logistics_metadata
+    from logistics import SeventeenTrackClient
+    from workflow.refresh_sample_logistics import refresh_sample_logistics
+
+    feishu_cfg = _feishu_config_from_args(args)
+    if feishu_cfg.auth_mode != "cli":
+        raise RuntimeError(
+            "样品物流刷新仅允许 FEISHU_AUTH_MODE=cli；不会降级为 App 凭证模式"
+        )
+    if args.max_age_hours < 0:
+        raise RuntimeError("--max-age-hours 不能小于 0")
+    if args.limit is not None and args.limit < 0:
+        raise RuntimeError("--limit 不能小于 0")
+
+    logistics_cfg = LogisticsConfig()
+    config_errors = logistics_cfg.validate(require_api_key=not args.dry_run)
+    if config_errors:
+        raise RuntimeError("；".join(config_errors))
+
+    context = _create_feishu_context(
+        feishu_cfg,
+        create_base_if_missing=False,
+    )
+    if context.auth_mode != "cli":
+        raise RuntimeError("样品物流刷新未获得 lark-cli 用户身份客户端")
+
+    client = context.client
+    table_id = _resolve_sample_tracking_table(
+        client,
+        logistics_cfg.sample_table_id,
+    )
+    validate_sample_logistics_metadata(
+        client.list_fields(table_id),
+        strict_order=False,
+    )
+
+    # Dry-run never calls the provider.  A sentinel keeps the workflow's
+    # provider contract explicit without requiring a secret for schema/candidate
+    # validation.
+    provider = (
+        object()
+        if args.dry_run
+        else SeventeenTrackClient(
+            logistics_cfg.api_key,
+            timeout=logistics_cfg.timeout_seconds,
+            max_retries=logistics_cfg.max_retries,
+        )
+    )
+    result = refresh_sample_logistics(
+        provider=provider,
+        client=client,
+        table_id=table_id,
+        sample_ids=args.sample_record_id,
+        limit=args.limit,
+        stale_hours=args.max_age_hours,
+        force=args.force,
+        dry_run=args.dry_run,
+        provider_name=logistics_cfg.provider,
+    )
+    result["finished_at"] = datetime.now().isoformat(timespec="seconds")
+    stats_path = _write_sample_logistics_stats(
+        result,
+        requested_path=args.stats,
+        prefix="sample_logistics_refresh",
+    )
+
+    print("\n样品物流刷新完成:")
+    print(f"  源记录: {result['source_records']}")
+    print(f"  候选记录: {result['candidate_records']}")
+    print(f"  唯一运单: {result['unique_shipments']}")
+    print(f"  待注册运单: {result['registration_shipments']}")
+    print(f"  物流查询: {result['provider_requests']}")
+    print(f"  计划更新: {result['planned_updates']}")
+    print(f"  实际更新: {result['actual_updates']}")
+    print(f"  物流状态: {result['status_counts']}")
+    print(f"  跳过原因: {result['skipped_counts']}")
+    print(f"  记录级错误: {len(result['errors'])}")
+    print(f"  统计: {stats_path}")
+
+    if result.get("write_failures"):
+        raise RuntimeError(
+            f"样品物流刷新有 {result['write_failures']} 条飞书记录写入失败；详情见统计文件"
+        )
+    if result.get("errors"):
+        print("  提示: 部分运单查询失败；其错误已脱敏记录，提醒阶段仍会继续并自动跳过不新鲜数据")
+
+
+def handle_dispatch_sample_reminders(args):
+    """Plan and send one CLI-only direct-message reminder digest."""
+    from feishu.sample_logistics import validate_sample_logistics_metadata
+    from notifications.feishu_cli import FeishuCliNotifier
+    from workflow.sample_reminders import dispatch_sample_reminders
+
+    feishu_cfg = _feishu_config_from_args(args)
+    if feishu_cfg.auth_mode != "cli":
+        raise RuntimeError(
+            "样品物流提醒仅允许 FEISHU_AUTH_MODE=cli；不会降级为 App 凭证模式"
+        )
+    if args.limit is not None and args.limit < 0:
+        raise RuntimeError("--limit 不能小于 0")
+
+    logistics_cfg = LogisticsConfig()
+    config_errors = logistics_cfg.validate(require_recipient=not args.dry_run)
+    if config_errors:
+        raise RuntimeError("；".join(config_errors))
+
+    context = _create_feishu_context(
+        feishu_cfg,
+        create_base_if_missing=False,
+    )
+    if context.auth_mode != "cli":
+        raise RuntimeError("样品物流提醒未获得 lark-cli 用户身份客户端")
+
+    client = context.client
+    table_id = _resolve_sample_tracking_table(
+        client,
+        logistics_cfg.sample_table_id,
+    )
+    validate_sample_logistics_metadata(
+        client.list_fields(table_id),
+        strict_order=False,
+    )
+
+    cli_manager = getattr(context, "cli_manager", None)
+    cli_path = (
+        getattr(cli_manager, "cli_path", "")
+        or feishu_cfg.cli_path
+        or "lark-cli"
+    )
+    notifier = FeishuCliNotifier(
+        cli_path=cli_path,
+        profile=feishu_cfg.cli_profile,
+        timeout=min(max(feishu_cfg.auth_timeout_seconds, 30), 120),
+    )
+    if not args.dry_run:
+        # Lock the approved destination before any outbox state is changed.
+        notifier.assert_current_user(logistics_cfg.reminder_receive_id)
+
+    result = dispatch_sample_reminders(
+        client=client,
+        table_id=table_id,
+        notifier=notifier,
+        recipient_user_id=logistics_cfg.reminder_receive_id,
+        base_url=context.base_url,
+        sample_ids=args.sample_record_id,
+        limit=args.limit,
+        dry_run=args.dry_run,
+        stagnation_hours=logistics_cfg.stall_hours,
+    )
+    result["finished_at"] = datetime.now().isoformat(timespec="seconds")
+    stats_path = _write_sample_logistics_stats(
+        result,
+        requested_path=args.stats,
+        prefix="sample_logistics_reminders",
+    )
+
+    print("\n样品物流提醒检查完成:")
+    print(f"  计划提醒: {result['planned_events']}")
+    print(f"  送达次日: {result['planned_delivery_reminders']}")
+    print(f"  三天无进度: {result['planned_stagnation_reminders']}")
+    print(f"  已发送事件: {result['sent']}")
+    print(f"  已发送消息: {result['messages_sent']}")
+    print(f"  跳过原因: {result['skipped_counts']}")
+    print(f"  统计: {stats_path}")
+
+
 def handle_exclusion(args):
     """Handle brand exclusion management."""
     excl = BrandExclusion.load(args.config)
@@ -1617,17 +2297,17 @@ def handle_exclusion(args):
     if args.add_brand:
         excl.add_brand(args.add_brand)
         excl.save(args.config)
-        print(f"✅ 添加品牌: {args.add_brand}")
+        print(f"[OK] 添加品牌: {args.add_brand}")
 
     if args.add_channel:
         excl.add_channel_id(args.add_channel)
         excl.save(args.config)
-        print(f"✅ 添加频道ID: {args.add_channel}")
+        print(f"[OK] 添加频道ID: {args.add_channel}")
 
     if args.add_keyword:
         excl.add_keyword(args.add_keyword)
         excl.save(args.config)
-        print(f"✅ 添加频道名称关键词: {args.add_keyword}")
+        print(f"[OK] 添加频道名称关键词: {args.add_keyword}")
 
     if args.import_file:
         import csv
@@ -1641,7 +2321,7 @@ def handle_exclusion(args):
                 if row.get("channel_keyword"):
                     excl.add_keyword(row["channel_keyword"])
         excl.save(args.config)
-        print(f"✅ 导入完成")
+        print("[OK] 导入完成")
 
     if args.list or not any([args.add_brand, args.add_channel, args.add_keyword, args.import_file]):
         print(f"\n品牌排除名单 ({args.config}):")

@@ -25,6 +25,17 @@ from urllib.parse import urlsplit
 DEFAULT_PROFILE = "kol-workflow"
 DEFAULT_TIMEOUT_SECONDS = 900.0
 DEFAULT_BASE_TIME_ZONE = "Asia/Shanghai"
+# Keep automatic installation reproducible. Upgrades are explicit code changes
+# that pass this repository's test matrix instead of silently following npm's
+# moving ``latest`` tag during an OAuth-sensitive setup flow.
+LARK_CLI_PACKAGE = "@larksuite/cli@1.0.70"
+FULL_WORKSPACE_SCOPES = (
+    "bitable:app",
+    "base:workflow:create",
+    "base:workflow:read",
+    "base:workflow:update",
+    "base:workflow:write",
+)
 
 # Only browser URLs owned by Feishu/Lark may be opened automatically.  Keep
 # this list deliberately narrow: accepting arbitrary HTTPS URLs would turn CLI
@@ -45,7 +56,7 @@ class LarkCliError(RuntimeError):
 
 
 class LarkCliRuntimeError(LarkCliError):
-    """Raised when Node.js/npx or lark-cli is unavailable."""
+    """Raised when Node.js/npm or lark-cli is unavailable."""
 
 
 class LarkCliCommandError(LarkCliError):
@@ -71,6 +82,7 @@ class RuntimeStatus:
     node: str | None
     npx: str | None
     lark_cli: str | None
+    npm: str | None = None
 
 
 @dataclass(frozen=True)
@@ -147,16 +159,17 @@ class LarkCliManager:
         return self._cli_path or self._resolve_cli_path()
 
     def detect_runtime(self) -> RuntimeStatus:
-        """Return resolved Node.js, npx, and CLI paths without changing state."""
+        """Return resolved Node.js, npm/npx, and CLI paths without changing state."""
 
         return RuntimeStatus(
             node=self._which("node"),
             npx=self._which("npx"),
+            npm=self._which("npm"),
             lark_cli=self._resolve_cli_path(),
         )
 
     def ensure_cli(self) -> tuple[str, bool]:
-        """Return a usable CLI path, installing it through npx when needed."""
+        """Return a usable CLI path, installing the pinned npm package when needed."""
 
         existing = self._resolve_cli_path()
         if existing:
@@ -169,8 +182,8 @@ class LarkCliManager:
             )
 
         node = self._which("node")
-        npx = self._which("npx")
-        missing = [name for name, path in (("Node.js", node), ("npx", npx)) if not path]
+        npm = self._which("npm")
+        missing = [name for name, path in (("Node.js", node), ("npm", npm)) if not path]
         if missing:
             raise LarkCliRuntimeError(
                 "Cannot install lark-cli because the required runtime is missing: "
@@ -179,7 +192,14 @@ class LarkCliManager:
 
         self._emit("正在安装飞书 CLI…")
         self._run(
-            [str(npx), "--yes", "@larksuite/cli@latest", "install"],
+            [
+                str(npm),
+                "install",
+                "--global",
+                "--no-audit",
+                "--no-fund",
+                LARK_CLI_PACKAGE,
+            ],
             label="install lark-cli",
             timeout=min(max(self.timeout, 120.0), 600.0),
         )
@@ -220,6 +240,40 @@ class LarkCliManager:
         )
         return self._command_indicates_success(result)
 
+    def full_workspace_scopes_valid(self) -> bool:
+        """Return whether the current user token can manage native workflows."""
+
+        cli = self._require_cli_path()
+        result = self._run(
+            [
+                cli,
+                "--profile",
+                self.profile,
+                "auth",
+                "check",
+                "--scope",
+                " ".join(FULL_WORKSPACE_SCOPES),
+                "--json",
+            ],
+            label="check full workspace scopes",
+            timeout=min(self.timeout, 60.0),
+            check=False,
+        )
+        return self._command_indicates_success(result)
+
+    def ensure_full_workspace_scopes(self) -> None:
+        """Request missing Workflow scopes using the established device flow."""
+
+        if self.full_workspace_scopes_valid():
+            return
+        cli = self._require_cli_path()
+        self._emit("正在申请飞书 Workflow 创建、读取、更新和启停权限…")
+        self._authorize(cli, scopes=FULL_WORKSPACE_SCOPES)
+        if not self.full_workspace_scopes_valid():
+            raise LarkCliCommandError(
+                "Feishu authorization completed but full workspace scopes are still missing"
+            )
+
     def ensure_ready(self) -> SetupResult:
         """Install, configure, authorize, and verify the named CLI profile."""
 
@@ -252,6 +306,8 @@ class LarkCliManager:
         name: str,
         *,
         time_zone: str = DEFAULT_BASE_TIME_ZONE,
+        table_name: str = "",
+        fields: Sequence[Mapping[str, Any]] = (),
     ) -> dict[str, str]:
         """Create a Base with CLI user authorization.
 
@@ -265,8 +321,7 @@ class LarkCliManager:
             raise ValueError("Base name must not be empty")
 
         ready = self.ensure_ready()
-        result = self._run(
-            [
+        command = [
                 ready.cli_path,
                 "--profile",
                 self.profile,
@@ -278,7 +333,21 @@ class LarkCliManager:
                 clean_name,
                 "--time-zone",
                 str(time_zone),
-            ],
+            ]
+        clean_table_name = str(table_name or "").strip()
+        if bool(clean_table_name) != bool(fields):
+            raise ValueError("table_name and fields must be provided together")
+        if clean_table_name:
+            command.extend(
+                [
+                    "--table-name",
+                    clean_table_name,
+                    "--fields",
+                    json.dumps(list(fields), ensure_ascii=False, separators=(",", ":")),
+                ]
+            )
+        result = self._run(
+            command,
             label="create Base",
             timeout=min(self.timeout, 120.0),
         )
@@ -302,6 +371,70 @@ class LarkCliManager:
         _validate_official_https_url(base_url)
 
         returned_name = _find_first_string(payload, ("name",)) or clean_name
+        created_target = {
+            "name": returned_name,
+            "app_token": token,
+            "base_url": base_url,
+        }
+        if clean_table_name:
+            created_target["initial_table_name"] = clean_table_name
+        return created_target
+
+    def resolve_base_url(self, url: str) -> dict[str, str]:
+        """Resolve a Base/Wiki/share URL through the authenticated CLI.
+
+        Wiki path tokens are not Bitable app tokens.  Delegating URL parsing to
+        ``base +url-resolve`` keeps that distinction inside the official CLI
+        and returns one stable shape to the client factory.
+        """
+
+        clean_url = str(url or "").strip()
+        if not clean_url:
+            raise ValueError("Base URL must not be empty")
+        # Validate before placing caller input in argv.  Error messages never
+        # echo the URL, which may contain resource identifiers.
+        _validate_official_https_url(clean_url)
+
+        ready = self.ensure_ready()
+        result = self._run(
+            [
+                ready.cli_path,
+                "--profile",
+                self.profile,
+                "base",
+                "+url-resolve",
+                "--as",
+                "user",
+                "--format",
+                "json",
+                "--url",
+                clean_url,
+            ],
+            label="resolve Base URL",
+            timeout=min(self.timeout, 120.0),
+        )
+        payload = self._parse_json_output(result, "resolve Base URL")
+        if isinstance(payload, Mapping) and payload.get("ok") is False:
+            raise LarkCliCommandError("resolve Base URL was rejected")
+
+        token = _find_first_string(
+            payload,
+            ("base_token", "baseToken", "app_token", "appToken"),
+        )
+        if not token:
+            raise LarkCliCommandError(
+                "Base URL was resolved but the CLI response did not include a base token"
+            )
+
+        base_url = _find_first_string(payload, ("base_url", "baseUrl", "url"))
+        if not base_url:
+            base_url = clean_url
+        _validate_official_https_url(base_url)
+
+        returned_name = _find_first_string(
+            payload,
+            ("base_name", "baseName", "name", "title"),
+        ) or ""
         return {
             "name": returned_name,
             "app_token": token,
@@ -331,21 +464,22 @@ class LarkCliManager:
                 "Feishu application setup completed but the CLI profile is unavailable"
             )
 
-    def _authorize(self, cli: str) -> None:
+    def _authorize(self, cli: str, *, scopes: Sequence[str] = ()) -> None:
         self._emit("正在申请飞书多维表格授权…")
-        initiate = self._run(
-            [
+        command = [
                 cli,
                 "--profile",
                 self.profile,
                 "auth",
                 "login",
-                "--domain",
-                "base",
-                "--recommend",
-                "--no-wait",
-                "--json",
-            ],
+            ]
+        if scopes:
+            command.extend(["--scope", " ".join(scopes)])
+        else:
+            command.extend(["--domain", "base", "--recommend"])
+        command.extend(["--no-wait", "--json"])
+        initiate = self._run(
+            command,
             label="start CLI authorization",
             timeout=min(self.timeout, 60.0),
         )

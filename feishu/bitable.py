@@ -13,6 +13,28 @@ from .auth import FeishuAuth, FEISHU_API_BASE
 logger = logging.getLogger("kol_workflow.feishu.bitable")
 
 
+def _batch_failure_summary(batch: List[Dict], start_index: int, result: Dict) -> str:
+    """Return useful batch diagnostics without serializing record values."""
+    field_names = sorted({
+        str(field_name)
+        for record in batch
+        if isinstance(record, dict)
+        for field_name in (
+            record.get("fields", {}).keys()
+            if isinstance(record.get("fields"), dict)
+            else ()
+        )
+    })
+    code = result.get("code", "unknown")
+    # API messages can echo invalid field values, credentials, or personal data.
+    # Keep the error code for diagnosis but deliberately omit the raw message.
+    return (
+        f"batch={start_index // 500 + 1}, start_index={start_index}, "
+        f"count={len(batch)}, fields={field_names}, "
+        f"error=Feishu API error (code={code!r}, message=<redacted>)"
+    )
+
+
 class BitableClient:
     """Feishu Bitable API client supporting multi-table operations."""
 
@@ -191,7 +213,9 @@ class BitableClient:
                 logger.error(f"读取记录失败: {result.get('msg')}")
                 break
 
-            records = result.get("data", {}).get("items", [])
+            # Feishu returns ``items: null`` for a table with no records.
+            # Normalize that wire representation to the public list contract.
+            records = result.get("data", {}).get("items") or []
             all_records.extend(records)
 
             has_more = result.get("data", {}).get("has_more", False)
@@ -338,9 +362,10 @@ class BitableClient:
             result = self._post(f"/tables/{table_id}/records/batch_create", data)
 
             if result.get("code") != 0:
-                logger.error(f"批量创建记录失败: {result.get('msg')}")
-                logger.debug(f"请求数据样本: {batch[0] if batch else 'empty'}")
-                raise RuntimeError(f"批量创建记录失败: {result.get('msg')}")
+                summary = _batch_failure_summary(batch, i, result)
+                logger.error("批量创建记录失败: %s", summary)
+                logger.debug("批量创建安全诊断: %s", summary)
+                raise RuntimeError(f"批量创建记录失败: {summary}")
 
             created = result.get("data", {}).get("records", [])
             total_created += len(created)
@@ -362,9 +387,10 @@ class BitableClient:
             result = self._post(f"/tables/{table_id}/records/batch_create", data)
 
             if result.get("code") != 0:
-                logger.error(f"批量创建记录失败: {result.get('msg')}")
-                logger.debug(f"请求数据样本: {batch[0] if batch else 'empty'}")
-                raise RuntimeError(f"批量创建记录失败: {result.get('msg')}")
+                summary = _batch_failure_summary(batch, i, result)
+                logger.error("批量创建记录失败: %s", summary)
+                logger.debug("批量创建安全诊断: %s", summary)
+                raise RuntimeError(f"批量创建记录失败: {summary}")
 
             created = result.get("data", {}).get("records", [])
             created_records.extend(created)
@@ -417,8 +443,10 @@ class BitableClient:
             result = self._post(f"/tables/{table_id}/records/batch_update", data)
 
             if result.get("code") != 0:
-                logger.error(f"批量更新记录失败: {result.get('msg')}")
-                raise RuntimeError(f"批量更新记录失败: {result.get('msg')}")
+                summary = _batch_failure_summary(batch, i, result)
+                logger.error("批量更新记录失败: %s", summary)
+                logger.debug("批量更新安全诊断: %s", summary)
+                raise RuntimeError(f"批量更新记录失败: {summary}")
 
             updated = result.get("data", {}).get("records", [])
             total_updated += len(updated)

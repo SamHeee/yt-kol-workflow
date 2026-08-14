@@ -59,6 +59,7 @@ class HangingProcess(FinishedProcess):
 def test_detect_runtime_is_read_only_and_cross_platform_names_are_resolved():
     paths = {
         "node": "/runtime/node",
+        "npm": "/runtime/npm",
         "npx": "/runtime/npx",
         "lark-cli": "/runtime/lark-cli",
     }
@@ -67,6 +68,7 @@ def test_detect_runtime_is_read_only_and_cross_platform_names_are_resolved():
     status = manager.detect_runtime()
 
     assert status.node == "/runtime/node"
+    assert status.npm == "/runtime/npm"
     assert status.npx == "/runtime/npx"
     assert status.lark_cli == "/runtime/lark-cli"
 
@@ -78,8 +80,8 @@ def test_ensure_cli_installs_exact_official_package_when_missing():
     def which(name):
         if name == "node":
             return "/bin/node"
-        if name == "npx":
-            return "/bin/npx"
+        if name == "npm":
+            return "/bin/npm"
         if name == "lark-cli" and installed:
             return "/bin/lark-cli"
         return None
@@ -88,10 +90,12 @@ def test_ensure_cli_installs_exact_official_package_when_missing():
         nonlocal installed
         calls.append((args, kwargs))
         assert args == [
-            "/bin/npx",
-            "--yes",
-            "@larksuite/cli@latest",
+            "/bin/npm",
             "install",
+            "--global",
+            "--no-audit",
+            "--no-fund",
+            "@larksuite/cli@1.0.70",
         ]
         assert kwargs["shell"] is False
         installed = True
@@ -106,10 +110,10 @@ def test_ensure_cli_installs_exact_official_package_when_missing():
     assert len(calls) == 1
 
 
-def test_ensure_cli_reports_missing_node_and_npx_without_running_installer():
+def test_ensure_cli_reports_missing_node_and_npm_without_running_installer():
     manager = LarkCliManager(which=lambda _name: None)
 
-    with pytest.raises(LarkCliRuntimeError, match="Node.js, npx"):
+    with pytest.raises(LarkCliRuntimeError, match="Node.js, npm"):
         manager.ensure_cli()
 
 
@@ -238,6 +242,51 @@ def test_valid_profile_and_authorization_skip_browser_flows():
     assert sum(command[-3:] == ["auth", "status", "--verify"] for command in calls) == 2
 
 
+def test_ensure_full_workspace_scopes_requests_only_explicit_scope_set():
+    calls = []
+    checks = 0
+
+    def runner(args, **kwargs):
+        nonlocal checks
+        calls.append(args)
+        if args[-5:-3] == ["auth", "check"] or "check" in args:
+            checks += 1
+            return completed(
+                args,
+                0 if checks > 1 else 1,
+                '{"ok":true}' if checks > 1 else '{"ok":false}',
+            )
+        if "--no-wait" in args:
+            return completed(
+                args,
+                stdout=json.dumps(
+                    {
+                        "verification_url": "https://accounts.feishu.cn/device",
+                        "device_code": "scope-device-code",
+                    }
+                ),
+            )
+        if "--device-code" in args:
+            return completed(args, stdout='{"ok":true}')
+        raise AssertionError(args)
+
+    manager = LarkCliManager(
+        cli_path="/bin/lark-cli",
+        path_exists=lambda _path: True,
+        runner=runner,
+        open_browser=lambda _url: True,
+    )
+
+    manager.ensure_full_workspace_scopes()
+
+    login = next(command for command in calls if "--no-wait" in command)
+    assert "--scope" in login
+    scope_value = login[login.index("--scope") + 1]
+    assert "base:workflow:write" in scope_value
+    assert "bitable:app" in scope_value
+    assert "--recommend" not in login
+
+
 def test_nested_verified_false_is_not_treated_as_authorized():
     manager = LarkCliManager(
         cli_path="/bin/lark-cli",
@@ -340,6 +389,96 @@ def test_cli_path_property_is_available_to_client_factory():
     assert manager.cli_path == "/bin/lark-cli"
 
 
+def test_resolve_base_url_uses_cli_shortcut_and_returns_stable_shape():
+    calls = []
+    wiki_url = "https://acme.feishu.cn/wiki/wikcnNodeToken"
+
+    def runner(args, **kwargs):
+        calls.append(args)
+        if args[-2:] == ["config", "show"]:
+            return completed(args, stdout='{"ok":true}')
+        if args[-3:] == ["auth", "status", "--verify"]:
+            return completed(args, stdout='{"ok":true,"tokenStatus":"valid"}')
+        if "+url-resolve" in args:
+            return completed(
+                args,
+                stdout=(
+                    '{"notice":"update available"}\n'
+                    '{"ok":true,"data":{"base_token":"bascnResolved",'
+                    '"base_name":"KOL CRM"}}'
+                ),
+            )
+        raise AssertionError(args)
+
+    manager = LarkCliManager(
+        cli_path="/bin/lark-cli",
+        path_exists=lambda _path: True,
+        runner=runner,
+    )
+
+    resolved = manager.resolve_base_url(wiki_url)
+
+    assert resolved == {
+        "name": "KOL CRM",
+        "app_token": "bascnResolved",
+        "base_url": wiki_url,
+    }
+    command = next(command for command in calls if "+url-resolve" in command)
+    assert command == [
+        "/bin/lark-cli",
+        "--profile",
+        "kol-workflow",
+        "base",
+        "+url-resolve",
+        "--as",
+        "user",
+        "--format",
+        "json",
+        "--url",
+        wiki_url,
+    ]
+
+
+def test_resolve_base_url_rejects_unofficial_or_insecure_input_before_cli():
+    manager = LarkCliManager(
+        cli_path="/bin/lark-cli",
+        path_exists=lambda _path: True,
+        runner=lambda *_args, **_kwargs: pytest.fail("must not run CLI"),
+    )
+
+    with pytest.raises(UnsafeAuthorizationUrlError, match="official"):
+        manager.resolve_base_url("https://attacker.example/wiki/secret")
+    with pytest.raises(UnsafeAuthorizationUrlError, match="official"):
+        manager.resolve_base_url("http://acme.feishu.cn/wiki/secret")
+
+
+def test_resolve_base_url_missing_token_does_not_echo_cli_output():
+    sensitive = "wikcn-sensitive-node-token"
+
+    def runner(args, **kwargs):
+        if args[-2:] == ["config", "show"]:
+            return completed(args, stdout='{"ok":true}')
+        if args[-3:] == ["auth", "status", "--verify"]:
+            return completed(args, stdout='{"ok":true}')
+        if "+url-resolve" in args:
+            return completed(
+                args,
+                stdout=json.dumps({"ok": True, "data": {"wiki_token": sensitive}}),
+            )
+        raise AssertionError(args)
+
+    manager = LarkCliManager(
+        cli_path="/bin/lark-cli",
+        path_exists=lambda _path: True,
+        runner=runner,
+    )
+
+    with pytest.raises(LarkCliCommandError, match="base token") as error:
+        manager.resolve_base_url("https://acme.feishu.cn/wiki/wikcnNodeToken")
+
+    assert sensitive not in str(error.value)
+
+
 def test_create_base_returns_stable_token_and_url_shape():
     calls = []
 
@@ -416,6 +555,40 @@ def test_create_base_builds_canonical_url_when_cli_only_returns_token():
 
     assert created["app_token"] == "bascnOnly"
     assert created["base_url"] == "https://www.feishu.cn/base/bascnOnly"
+
+
+def test_create_base_can_define_the_single_managed_initial_table():
+    calls = []
+
+    def runner(args, **kwargs):
+        calls.append(args)
+        if args[-2:] == ["config", "show"]:
+            return completed(args, stdout='{"ok":true}')
+        if args[-3:] == ["auth", "status", "--verify"]:
+            return completed(args, stdout='{"ok":true}')
+        if "+base-create" in args:
+            return completed(args, stdout='{"data":{"base":{"token":"bascnOnly"}}}')
+        raise AssertionError(args)
+
+    manager = LarkCliManager(
+        cli_path="/bin/lark-cli",
+        path_exists=lambda _path: True,
+        runner=runner,
+    )
+    created = manager.create_base(
+        "KOL Workflow",
+        table_name="搜索任务表",
+        fields=[{"name": "多行文本", "type": "text"}],
+    )
+
+    command = next(item for item in calls if "+base-create" in item)
+    assert command[-4:] == [
+        "--table-name",
+        "搜索任务表",
+        "--fields",
+        '[{"name":"多行文本","type":"text"}]',
+    ]
+    assert created["initial_table_name"] == "搜索任务表"
 
 
 def test_create_base_requires_token_but_does_not_echo_raw_cli_output():

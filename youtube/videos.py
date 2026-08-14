@@ -6,6 +6,7 @@ import re
 import logging
 from datetime import datetime
 from typing import List, Dict, Tuple
+from urllib.parse import parse_qs, urlparse
 
 from .client import api_request
 
@@ -16,6 +17,58 @@ MAX_BATCH_SIZE = 50
 
 # ISO 8601 duration
 DURATION_PATTERN = re.compile(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
+VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
+YOUTUBE_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+}
+YOUTUBE_NOCOOKIE_HOSTS = {
+    "youtube-nocookie.com",
+    "www.youtube-nocookie.com",
+}
+YOUTU_BE_HOSTS = {"youtu.be", "www.youtu.be"}
+
+
+def extract_video_id(value: str) -> str:
+    """Return one validated YouTube video ID from a supported URL or raw ID.
+
+    Supported URL shapes are ``watch?v=``, ``youtu.be/``, ``shorts/``,
+    ``live/`` and ``embed/``.  Hosts are allow-listed so lookalike domains do
+    not become API inputs.  A valid YouTube video ID is exactly 11 characters.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if VIDEO_ID_PATTERN.fullmatch(text):
+        return text
+
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return ""
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return ""
+
+    host = (parsed.hostname or "").lower()
+    candidate = ""
+    if host in YOUTU_BE_HOSTS:
+        parts = [part for part in parsed.path.split("/") if part]
+        candidate = parts[0] if len(parts) == 1 else ""
+    elif host in YOUTUBE_HOSTS:
+        if parsed.path.rstrip("/") == "/watch":
+            candidate = (parse_qs(parsed.query).get("v") or [""])[0]
+        else:
+            parts = [part for part in parsed.path.split("/") if part]
+            if len(parts) == 2 and parts[0] in {"shorts", "live", "embed"}:
+                candidate = parts[1]
+    elif host in YOUTUBE_NOCOOKIE_HOSTS:
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) == 2 and parts[0] == "embed":
+            candidate = parts[1]
+
+    return candidate if VIDEO_ID_PATTERN.fullmatch(candidate) else ""
 
 
 def parse_duration(iso_duration: str) -> Tuple[int, str]:
@@ -110,6 +163,9 @@ def _parse_video_item(item: Dict) -> Dict:
     view_count = _safe_int(stats.get("viewCount", 0))
     like_count = _safe_int(stats.get("likeCount", 0))
     comment_count = _safe_int(stats.get("commentCount", 0))
+    view_count_available = "viewCount" in stats
+    like_count_available = "likeCount" in stats
+    comment_count_available = "commentCount" in stats
 
     # Calculate engagement rate
     engagement_rate = 0.0
@@ -136,6 +192,9 @@ def _parse_video_item(item: Dict) -> Dict:
         "view_count": view_count,
         "like_count": like_count,
         "comment_count": comment_count,
+        "view_count_available": view_count_available,
+        "like_count_available": like_count_available,
+        "comment_count_available": comment_count_available,
         "engagement_rate": engagement_rate,
         "duration_seconds": duration_sec,
         "duration_hms": duration_hms,

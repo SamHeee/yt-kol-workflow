@@ -7,10 +7,10 @@ Reads from .env, CLI args, and brand_exclusions.json.
 
 import os
 import json
-import re
 from pathlib import Path
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # Project root directory (where config.py is located)
 PROJECT_ROOT = Path(__file__).parent
@@ -87,15 +87,16 @@ class FeishuConfig:
 
     @staticmethod
     def extract_app_token(url_or_token: str) -> str:
-        """Extract app_token from a Feishu URL or return as-is if already a token."""
-        if not url_or_token:
+        """Keep URLs intact for CLI resolution; return plain tokens unchanged.
+
+        A Wiki URL contains a node token rather than a Bitable app token.  URL
+        resolution therefore has to happen after the lark-cli profile is ready
+        instead of being guessed from the path here.
+        """
+        value = str(url_or_token or "").strip()
+        if not value:
             return ""
-        # Try to extract from URL pattern: /wiki/{app_token} or /base/{app_token}
-        match = re.search(r'(?:wiki|base)/([a-zA-Z0-9]+)', url_or_token)
-        if match:
-            return match.group(1)
-        # Already a plain token
-        return url_or_token.strip()
+        return value
 
     def create_auth(self) -> "FeishuAuth":
         """Create a FeishuAuth instance with this config's credentials.
@@ -110,6 +111,106 @@ class FeishuConfig:
         """Invalidate cached token, forcing re-auth on next call."""
         auth = self.create_auth()
         auth.invalidate()
+
+
+@dataclass
+class LogisticsConfig:
+    """Configuration for the sample-shipment logistics workflow.
+
+    The provider credential is read from the environment only.  It is never
+    accepted as a command-line option, which keeps it out of shell history and
+    process argument lists.
+    """
+
+    provider: str = ""
+    api_key: str = ""
+    timeout_seconds: int = 0
+    max_retries: Optional[int] = None
+    timezone_name: str = ""
+    stall_hours: float = 0
+    sample_table_id: str = ""
+    reminder_receive_id: str = ""
+
+    def __post_init__(self):
+        if not self.provider:
+            self.provider = (
+                os.environ.get("LOGISTICS_PROVIDER", "17track").strip().lower()
+                or "17track"
+            )
+        if self.provider not in {"17track"}:
+            raise ValueError("LOGISTICS_PROVIDER 当前仅支持 17track")
+
+        if not self.api_key:
+            self.api_key = os.environ.get("TRACK17_API_KEY", "").strip()
+
+        if not self.timeout_seconds:
+            try:
+                self.timeout_seconds = int(
+                    os.environ.get("LOGISTICS_HTTP_TIMEOUT_SECONDS", "30")
+                )
+            except ValueError:
+                self.timeout_seconds = 30
+        if self.timeout_seconds <= 0:
+            raise ValueError("LOGISTICS_HTTP_TIMEOUT_SECONDS 必须大于 0")
+
+        if self.max_retries is None:
+            try:
+                self.max_retries = int(
+                    os.environ.get("LOGISTICS_MAX_RETRIES", "2")
+                )
+            except ValueError:
+                self.max_retries = 2
+        if self.max_retries < 0:
+            raise ValueError("LOGISTICS_MAX_RETRIES 不能小于 0")
+
+        if not self.timezone_name:
+            self.timezone_name = (
+                os.environ.get("SAMPLE_LOGISTICS_TIMEZONE", "Asia/Shanghai").strip()
+                or "Asia/Shanghai"
+            )
+        if self.timezone_name != "Asia/Shanghai":
+            raise ValueError(
+                "SAMPLE_LOGISTICS_TIMEZONE 当前必须是 Asia/Shanghai"
+            )
+        try:
+            ZoneInfo(self.timezone_name)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(
+                f"SAMPLE_LOGISTICS_TIMEZONE 不是有效时区: {self.timezone_name}"
+            ) from exc
+
+        if not self.stall_hours:
+            try:
+                self.stall_hours = float(
+                    os.environ.get("SAMPLE_LOGISTICS_STALL_HOURS", "72")
+                )
+            except ValueError:
+                self.stall_hours = 72
+        if self.stall_hours <= 0:
+            raise ValueError("SAMPLE_LOGISTICS_STALL_HOURS 必须大于 0")
+
+        if not self.sample_table_id:
+            self.sample_table_id = os.environ.get(
+                "SAMPLE_TRACKING_TABLE_ID", ""
+            ).strip()
+        if not self.reminder_receive_id:
+            self.reminder_receive_id = os.environ.get(
+                "SAMPLE_REMINDER_USER_OPEN_ID", ""
+            ).strip()
+
+    def validate(
+        self,
+        *,
+        require_api_key: bool = False,
+        require_recipient: bool = False,
+    ) -> List[str]:
+        """Return actionable configuration errors for the requested action."""
+        errors: List[str] = []
+        if require_api_key and not self.api_key:
+            errors.append("物流刷新缺少 TRACK17_API_KEY")
+        if require_recipient and not self.reminder_receive_id:
+            errors.append("物流提醒缺少 SAMPLE_REMINDER_USER_OPEN_ID")
+        return errors
 
 
 @dataclass
@@ -177,6 +278,7 @@ class WorkflowConfig:
     """Top-level configuration container."""
     youtube: YouTubeConfig = field(default_factory=YouTubeConfig)
     feishu: FeishuConfig = field(default_factory=FeishuConfig)
+    logistics: LogisticsConfig = field(default_factory=LogisticsConfig)
     brand_exclusion: BrandExclusion = field(default_factory=BrandExclusion)
     output_dir: str = ""  # 空字符串表示使用项目目录下的 output
     log_level: str = "INFO"
@@ -189,6 +291,7 @@ class WorkflowConfig:
     min_subscribers: int = 0
     estimated_channels_per_keyword: int = 15
     seen_channels_file: str = ""
+    seen_channels_explicit: bool = field(default=False, init=False, repr=False)
     search_filters: Dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -197,9 +300,38 @@ class WorkflowConfig:
             self.output_dir = str(PROJECT_ROOT / "output")
         # 转换为绝对路径，确保目录一致性
         self.output_dir = str(Path(self.output_dir).resolve())
+        self.seen_channels_explicit = bool(self.seen_channels_file)
         if not self.seen_channels_file:
-            self.seen_channels_file = str(PROJECT_ROOT / "seen_channels.json")
+            from workflow.seen_channels import default_seen_channels_path
+
+            self.seen_channels_file = str(
+                default_seen_channels_path(
+                    cli_profile=self.feishu.cli_profile,
+                    app_token=self.feishu.app_token,
+                )
+            )
         self.seen_channels_file = str(Path(self.seen_channels_file).resolve())
+
+    def bind_seen_channels_target(self) -> str:
+        """Bind implicit dedupe state to the resolved Feishu Base target."""
+
+        if self.seen_channels_explicit:
+            return self.seen_channels_file
+        from workflow.seen_channels import default_seen_channels_path
+
+        self.seen_channels_file = str(
+            default_seen_channels_path(
+                cli_profile=self.feishu.cli_profile,
+                app_token=self.feishu.app_token,
+            ).resolve()
+        )
+        return self.seen_channels_file
+
+    def bind_feishu_target(self, app_token: str) -> str:
+        """Record the resolved Base and rebind only implicit local state."""
+
+        self.feishu.app_token = str(app_token or "").strip()
+        return self.bind_seen_channels_target()
 
     def validate(self, require_youtube: bool = True, require_feishu: bool = False) -> List[str]:
         """Validate configuration, return list of errors."""

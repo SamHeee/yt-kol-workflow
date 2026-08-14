@@ -51,7 +51,7 @@ class QuotaTracker:
         remaining_pct = self.remaining() / self.daily_limit if self.daily_limit else 0
         if remaining_pct < threshold_pct:
             logger.warning(
-                f"⚠️ 配额警告: 剩余 {self.remaining()} units "
+                f"[WARN] 配额警告: 剩余 {self.remaining()} units "
                 f"({remaining_pct*100:.0f}%)"
             )
 
