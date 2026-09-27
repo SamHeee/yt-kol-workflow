@@ -22,6 +22,8 @@ COOPERATION_RECORD_ID_FIELD = "合作记录ID"
 CONTACT_EMAIL_FIELD = "联系邮箱"
 KOL_NAME_FIELD = "KOL Name"
 SAMPLE_DETAIL_FIELD = "样品明细"
+SAMPLE_COST_FIELD = "样品成本"
+SAMPLE_SHIPPING_COST_FIELD = "样品运费"
 RECIPIENT_INFO_FIELD = "收件信息"
 SAMPLE_STATUS_FIELD = "样品状态"
 CARRIER_FIELD = "物流商"
@@ -46,10 +48,9 @@ REMINDER_SENT_AT_FIELD = "提醒发送时间"
 REMINDER_ERROR_FIELD = "提醒错误"
 
 
-# Feishu field type IDs: text=1, single-select=3, date=5, lookup=19 and
-# auto-number=1005.  The original 14 columns are retained verbatim and the
-# logistics/reminder fields are appended so the blank primary column remains
-# untouched.
+# Feishu field type IDs: text=1, number=2, single-select=3, date=5,
+# lookup=19 and auto-number=1005.  Manual sample cost fields follow the
+# sample detail; logistics/reminder fields remain appended.
 SAMPLE_LOGISTICS_FIELDS: List[Tuple[str, int]] = [
     (PRIMARY_FIELD_NAME, 1),
     (SAMPLE_RECORD_ID_FIELD, 1005),
@@ -58,6 +59,8 @@ SAMPLE_LOGISTICS_FIELDS: List[Tuple[str, int]] = [
     (CONTACT_EMAIL_FIELD, 19),
     (KOL_NAME_FIELD, 1),
     (SAMPLE_DETAIL_FIELD, 1),
+    (SAMPLE_COST_FIELD, 2),
+    (SAMPLE_SHIPPING_COST_FIELD, 2),
     (RECIPIENT_INFO_FIELD, 19),
     (SAMPLE_STATUS_FIELD, 3),
     (CARRIER_FIELD, 1),
@@ -158,6 +161,8 @@ NEVER_SYSTEM_WRITABLE_FIELDS = frozenset({
     CONTACT_EMAIL_FIELD,
     KOL_NAME_FIELD,
     SAMPLE_DETAIL_FIELD,
+    SAMPLE_COST_FIELD,
+    SAMPLE_SHIPPING_COST_FIELD,
     RECIPIENT_INFO_FIELD,
     CARRIER_FIELD,
     TRACKING_NUMBER_FIELD,
@@ -279,6 +284,13 @@ def metadata_errors(
         ]
         if actual_options != list(expected):
             errors.append(f"{field_name}选项错误: {actual_options}")
+
+    for field_name in (SAMPLE_COST_FIELD, SAMPLE_SHIPPING_COST_FIELD):
+        formatter = str(((by_name.get(field_name) or {}).get("property") or {}).get("formatter") or "")
+        if formatter != "0.00":
+            errors.append(
+                f"{field_name}数字格式错误: 应为 0.00，实际为 {formatter!r}"
+            )
 
     date_fields = {
         SHIPPED_DATE_FIELD: "yyyy-MM-dd",

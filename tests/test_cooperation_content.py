@@ -64,6 +64,9 @@ def _full_metadata():
     for field_name in (VIEWS_FIELD, LIKES_FIELD, COMMENTS_FIELD):
         by_name[field_name]["property"] = {"formatter": "1,000"}
     by_name[ENGAGEMENT_RATE_FIELD]["property"] = {"formatter": "0.00"}
+    for field_name in ("归因点击", "归因订单量", "归因销量"):
+        by_name[field_name]["property"] = {"formatter": "1,000"}
+    by_name["归因GMV"]["property"] = {"formatter": "0.00"}
     for field_name in (PUBLISH_TIME_FIELD, DATA_UPDATED_AT_FIELD):
         by_name[field_name]["property"] = {
             "auto_fill": False,
@@ -110,12 +113,17 @@ def _full_metadata():
     return fields, cooperation_fields, sample_fields
 
 
-def test_contract_has_exactly_19_fields_and_blank_primary_first():
-    assert len(COOPERATION_CONTENT_FIELDS) == 19
+def test_contract_has_attribution_fields_after_engagement_rate():
+    assert len(COOPERATION_CONTENT_FIELDS) == 23
     assert COOPERATION_CONTENT_FIELDS[0] == ("多行文本", 1)
     assert COOPERATION_CONTENT_FIELDS[1] == ("内容记录ID", 1005)
     assert dict(COOPERATION_CONTENT_FIELDS)[CHANNEL_ID_FIELD] == 19
     assert dict(COOPERATION_CONTENT_FIELDS)[SAMPLE_RECORD_ID_FIELD] == 19
+    assert field_names()[15:21] == (
+        "互动率(%)", "归因点击", "归因GMV", "归因订单量", "归因销量", "数据更新时间"
+    )
+    for name in ("归因点击", "归因GMV", "归因订单量", "归因销量"):
+        assert dict(COOPERATION_CONTENT_FIELDS)[name] == 2
     assert field_names()[-2:] == ("数据同步状态", "同步错误")
 
 
@@ -141,10 +149,15 @@ def test_system_write_whitelist_excludes_keys_url_lookup_and_primary():
     assert "合作自动编号" not in SYSTEM_WRITABLE_FIELDS
     assert "Channel ID" not in SYSTEM_WRITABLE_FIELDS
     assert "内容状态" in SYSTEM_WRITABLE_FIELDS
+    attribution_fields = {"归因点击", "归因GMV", "归因订单量", "归因销量"}
+    assert attribution_fields <= NEVER_SYSTEM_WRITABLE_FIELDS
+    assert attribution_fields.isdisjoint(SYSTEM_WRITABLE_FIELDS)
 
     assert validate_system_update_fields({"Views": 123}) == {"Views": 123}
     with pytest.raises(ValueError, match="禁止写入字段"):
         validate_system_update_fields({"视频URL": "https://youtu.be/abcdefghijk"})
+    with pytest.raises(ValueError, match="归因GMV"):
+        validate_system_update_fields({"归因GMV": 12.34})
 
 
 def test_schema_validator_checks_names_types_and_order():
@@ -285,6 +298,10 @@ def test_full_metadata_validator_rejects_unsafe_lookup_details(mutation, message
         (LIKES_FIELD, {"formatter": "0"}, "Likes数字格式错误"),
         (COMMENTS_FIELD, {"formatter": "0"}, "Comments数字格式错误"),
         (ENGAGEMENT_RATE_FIELD, {"formatter": "0.0"}, "互动率.*数字格式错误"),
+        ("归因点击", {"formatter": "0.00"}, "归因点击数字格式错误"),
+        ("归因GMV", {"formatter": "1,000"}, "归因GMV数字格式错误"),
+        ("归因订单量", {"formatter": "0.00"}, "归因订单量数字格式错误"),
+        ("归因销量", {"formatter": "0.00"}, "归因销量数字格式错误"),
         (
             PUBLISH_TIME_FIELD,
             {"date_formatter": "yyyy-MM-dd"},

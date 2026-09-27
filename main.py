@@ -1786,9 +1786,14 @@ def handle_feishu_setup(args):
     )
 
     if dry_run:
+        from feishu.full_schema import FULL_SCHEMA
+
         print("\n飞书完整工作区变更计划（只读）:")
         if not result.plan.actions:
-            print("  无变更：7 张表、141 个字段及首次合作 Workflow 已就绪")
+            print(
+                f"  无变更：{len(FULL_SCHEMA.tables)} 张表、"
+                f"{FULL_SCHEMA.field_count} 个字段及首次合作 Workflow 已就绪"
+            )
         for action in result.plan.actions:
             detail = f"（{action.detail}）" if action.detail else ""
             print(f"  - {action.kind}: {action.target}{detail}")
@@ -1798,13 +1803,18 @@ def handle_feishu_setup(args):
     # The complete helper ran the established four-table record-level health
     # check before it enabled the Workflow.  Operations tables are validated
     # strictly as metadata and never receive mock business rows during setup.
+    from feishu.full_schema import FULL_SCHEMA
+
     schema_mgr = result.schema_manager
     print("\n飞书设置完成:")
     print(f"  认证模式: {context.auth_mode}")
     print(f"  Profile: {feishu_cfg.cli_profile if context.auth_mode == 'cli' else '-'}")
     print(f"  Base: {context.base_url or mask_app_token(context.app_token)}")
-    print("  工作表: 7 张（setup 不新增业务视图）")
-    print("  必需字段: 141 个；Lookup: 9 个")
+    print(f"  工作表: {len(FULL_SCHEMA.tables)} 张（setup 不新增业务视图）")
+    print(
+        f"  必需字段: {FULL_SCHEMA.field_count} 个；"
+        f"Lookup: {FULL_SCHEMA.lookup_count} 个"
+    )
     print(
         "  首次合作自动建档: "
         + ("已启用" if result.workflow_enabled else "已创建并保持禁用")

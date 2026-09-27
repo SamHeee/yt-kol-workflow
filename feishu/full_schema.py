@@ -394,6 +394,13 @@ COOPERATION_STATUS_OPTIONS = (
     "已完成",
     "已取消",
 )
+COOPERATION_TYPE_OPTIONS = (
+    "免费置换",
+    "纯佣",
+    "固定费用",
+    "固定费用+纯佣",
+    "其他",
+)
 
 COOPERATION_FIELDS = (
     FieldSpec(PRIMARY_FIELD_NAME, TEXT, is_primary=True),
@@ -427,7 +434,9 @@ COOPERATION_FIELDS = (
         ),
     ),
     FieldSpec("合作项目", TEXT),
-    FieldSpec("合作形式", TEXT),
+    FieldSpec("合作形式", SINGLE_SELECT, options=COOPERATION_TYPE_OPTIONS),
+    FieldSpec("合作费用", NUMBER, number_format="0.00"),
+    FieldSpec("专属code", TEXT),
     FieldSpec("收件信息", TEXT),
     FieldSpec("合作状态", SINGLE_SELECT, options=COOPERATION_STATUS_OPTIONS),
     FieldSpec("合作负责人", PERSON, multiple=False),
@@ -468,6 +477,8 @@ SAMPLE_LOOKUP_SPECS = MappingProxyType(
 
 SAMPLE_FIELD_PROPERTIES = {
     "样品记录ID": {"auto_number_prefix": "SMP-", "auto_number_length": 6},
+    "样品成本": {"number_format": "0.00"},
+    "样品运费": {"number_format": "0.00"},
     "联系邮箱": {"lookup": SAMPLE_LOOKUP_SPECS["联系邮箱"]},
     "收件信息": {"lookup": SAMPLE_LOOKUP_SPECS["收件信息"]},
     "发货日期": {"date_format": "yyyy-MM-dd"},
@@ -494,6 +505,10 @@ CONTENT_FIELD_PROPERTIES = {
     "Likes": {"number_format": "1,000"},
     "Comments": {"number_format": "1,000"},
     "互动率(%)": {"number_format": "0.00"},
+    "归因点击": {"number_format": "1,000"},
+    "归因GMV": {"number_format": "0.00"},
+    "归因订单量": {"number_format": "1,000"},
+    "归因销量": {"number_format": "1,000"},
     "数据更新时间": {"date_format": "yyyy-MM-dd HH:mm"},
 }
 

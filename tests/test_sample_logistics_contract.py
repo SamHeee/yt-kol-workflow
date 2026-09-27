@@ -6,6 +6,7 @@ from feishu.sample_logistics import (
     LOGISTICS_STATUS_FIELD,
     LOGISTICS_STATUS_OPTIONS,
     LOGISTICS_WRITABLE_FIELDS,
+    NEVER_SYSTEM_WRITABLE_FIELDS,
     REMINDER_STATUS_FIELD,
     REMINDER_STATUS_OPTIONS,
     REMINDER_TYPE_FIELD,
@@ -101,16 +102,24 @@ def _field_metadata():
                 "date_formatter": date_formatters[name],
                 "auto_fill": False,
             }
+        elif name in ("样品成本", "样品运费"):
+            item["property"] = {"formatter": "0.00"}
         fields.append(item)
     return fields
 
 
-def test_contract_retains_original_columns_and_appends_exactly_14_fields():
+def test_contract_inserts_cost_columns_after_sample_detail():
     names = tuple(field_names())
 
-    assert len(SAMPLE_LOGISTICS_FIELDS) == 28
-    assert names[:14] == ORIGINAL_FIELDS
-    assert names[14:] == ADDED_FIELDS
+    assert len(SAMPLE_LOGISTICS_FIELDS) == 30
+    assert names == (
+        ORIGINAL_FIELDS[:7]
+        + ("样品成本", "样品运费")
+        + ORIGINAL_FIELDS[7:]
+        + ADDED_FIELDS
+    )
+    assert dict(SAMPLE_LOGISTICS_FIELDS)["样品成本"] == 2
+    assert dict(SAMPLE_LOGISTICS_FIELDS)["样品运费"] == 2
     assert names[0] == "多行文本"
 
 
@@ -119,9 +128,12 @@ def test_schema_validation_detects_order_type_missing_and_extra_fields():
     validate_sample_logistics_schema(valid)
 
     invalid = deepcopy(valid)
-    invalid[14], invalid[15] = invalid[15], invalid[14]
-    invalid[16]["type"] = 1
-    invalid.pop(17)
+    names = tuple(field_names())
+    code_index = names.index("物流商编码")
+    synced_index = names.index("已同步运单键")
+    invalid[code_index], invalid[synced_index] = invalid[synced_index], invalid[code_index]
+    invalid[names.index("物流状态")]["type"] = 1
+    invalid.pop(names.index("最新物流进度"))
     invalid.append({"field_name": "意外字段", "type": 1})
 
     errors = schema_errors(invalid)
@@ -143,12 +155,14 @@ def test_metadata_validation_covers_primary_auto_number_selects_and_dates():
     by_name = {item["field_name"]: item for item in invalid}
     by_name[LOGISTICS_STATUS_FIELD]["property"]["options"].reverse()
     by_name["上次查询时间"]["property"]["date_formatter"] = "yyyy-MM-dd"
+    by_name["样品成本"]["property"]["formatter"] = "0"
 
     errors = metadata_errors(invalid)
     assert any("不是主字段" in error for error in errors)
     assert any("SMP-" in error for error in errors)
     assert any(LOGISTICS_STATUS_FIELD in error and "选项错误" in error for error in errors)
     assert any("上次查询时间" in error and "日期格式错误" in error for error in errors)
+    assert any("样品成本" in error and "数字格式错误" in error for error in errors)
 
 
 def test_metadata_validation_can_ignore_unstable_cli_field_list_order():
@@ -160,6 +174,10 @@ def test_metadata_validation_can_ignore_unstable_cli_field_list_order():
 
 
 def test_refresh_and_reminder_write_whitelists_are_separate_and_strict():
+    assert {"样品成本", "样品运费"} <= NEVER_SYSTEM_WRITABLE_FIELDS
+    assert {"样品成本", "样品运费"}.isdisjoint(LOGISTICS_WRITABLE_FIELDS)
+    assert {"样品成本", "样品运费"}.isdisjoint(REMINDER_WRITABLE_FIELDS)
+
     refresh_fields = validate_logistics_update_fields({
         "物流状态": "运输中",
         "最新物流进度": "Shanghai｜已离开处理中心",

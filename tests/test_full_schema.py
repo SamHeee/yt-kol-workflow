@@ -10,10 +10,13 @@ from feishu.full_schema import (
     FORMULA,
     FULL_SCHEMA,
     LOOKUP,
+    NUMBER,
     OUTREACH_LETTER_FORMULA,
     OUTREACH_LETTER_TEMPLATE,
     SAMPLE_LOOKUP_SPECS,
+    SINGLE_SELECT,
     TABLE_SPECS,
+    TEXT,
 )
 from feishu.sample_logistics import SAMPLE_TRACKING_TABLE
 from feishu.schema import (
@@ -39,9 +42,9 @@ EXPECTED_TABLE_ORDER = (
 )
 
 
-def test_full_contract_has_seven_tables_141_fields_and_nine_lookups():
+def test_full_contract_has_seven_tables_149_fields_and_nine_lookups():
     assert FULL_SCHEMA.table_names == EXPECTED_TABLE_ORDER
-    assert FULL_SCHEMA.field_count == 141
+    assert FULL_SCHEMA.field_count == 149
     assert FULL_SCHEMA.lookup_count == 9
     assert FULL_SCHEMA.view_count == 7
     assert set(TABLE_SPECS) == set(EXPECTED_TABLE_ORDER)
@@ -223,6 +226,36 @@ def test_select_date_and_number_metadata_needed_by_runtime_is_present():
         "已完成",
         "已取消",
     )
+    assert cooperation.field("合作形式").field_type == SINGLE_SELECT
+    assert cooperation.field("合作形式").options == (
+        "免费置换",
+        "纯佣",
+        "固定费用",
+        "固定费用+纯佣",
+        "其他",
+    )
+    assert [field.name for field in cooperation.fields][7:11] == [
+        "合作形式", "合作费用", "专属code", "收件信息"
+    ]
+    assert cooperation.field("合作费用").field_type == NUMBER
+    assert cooperation.field("合作费用").number_format == "0.00"
+    assert cooperation.field("专属code").field_type == TEXT
+
+    assert [field.name for field in sample.fields][6:10] == [
+        "样品明细", "样品成本", "样品运费", "收件信息"
+    ]
+    for name in ("样品成本", "样品运费"):
+        assert sample.field(name).field_type == NUMBER
+        assert sample.field(name).number_format == "0.00"
+
+    assert [field.name for field in content.fields][15:21] == [
+        "互动率(%)", "归因点击", "归因GMV", "归因订单量", "归因销量", "数据更新时间"
+    ]
+    for name in ("归因点击", "归因订单量", "归因销量"):
+        assert content.field(name).field_type == NUMBER
+        assert content.field(name).number_format == "1,000"
+    assert content.field("归因GMV").field_type == NUMBER
+    assert content.field("归因GMV").number_format == "0.00"
     assert sample.field("样品状态").options == (
         "待收件信息",
         "待寄出",

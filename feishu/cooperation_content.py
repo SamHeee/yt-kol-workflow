@@ -35,6 +35,10 @@ VIEWS_FIELD = "Views"
 LIKES_FIELD = "Likes"
 COMMENTS_FIELD = "Comments"
 ENGAGEMENT_RATE_FIELD = "互动率(%)"
+ATTRIBUTED_CLICKS_FIELD = "归因点击"
+ATTRIBUTED_GMV_FIELD = "归因GMV"
+ATTRIBUTED_ORDERS_FIELD = "归因订单量"
+ATTRIBUTED_SALES_FIELD = "归因销量"
 DATA_UPDATED_AT_FIELD = "数据更新时间"
 SYNC_STATUS_FIELD = "数据同步状态"
 SYNC_ERROR_FIELD = "同步错误"
@@ -59,6 +63,10 @@ COOPERATION_CONTENT_FIELDS: List[Tuple[str, int]] = [
     (LIKES_FIELD, 2),
     (COMMENTS_FIELD, 2),
     (ENGAGEMENT_RATE_FIELD, 2),
+    (ATTRIBUTED_CLICKS_FIELD, 2),
+    (ATTRIBUTED_GMV_FIELD, 2),
+    (ATTRIBUTED_ORDERS_FIELD, 2),
+    (ATTRIBUTED_SALES_FIELD, 2),
     (DATA_UPDATED_AT_FIELD, 5),
     (SYNC_STATUS_FIELD, 3),
     (SYNC_ERROR_FIELD, 1),
@@ -150,6 +158,10 @@ NEVER_SYSTEM_WRITABLE_FIELDS = frozenset({
     KOL_NAME_FIELD,
     SAMPLE_RECORD_ID_FIELD,
     VIDEO_URL_FIELD,
+    ATTRIBUTED_CLICKS_FIELD,
+    ATTRIBUTED_GMV_FIELD,
+    ATTRIBUTED_ORDERS_FIELD,
+    ATTRIBUTED_SALES_FIELD,
 })
 
 
@@ -163,7 +175,7 @@ def schema_errors(
     strict_order: bool = True,
     allow_extra: bool = False,
 ) -> List[str]:
-    """Return human-readable differences from the 19-field contract."""
+    """Return human-readable differences from the physical field contract."""
     actual = list(fields)
     expected_names = [name for name, _ in COOPERATION_CONTENT_FIELDS]
     expected_types = dict(COOPERATION_CONTENT_FIELDS)
@@ -199,7 +211,7 @@ def schema_errors(
     if strict_order:
         comparable_actual = [name for name in actual_names if name in expected_types]
         if comparable_actual != expected_names:
-            errors.append("字段顺序与19字段合同不一致")
+            errors.append("字段顺序与合作内容字段合同不一致")
 
     return errors
 
@@ -277,6 +289,10 @@ def metadata_errors(
         LIKES_FIELD: "1,000",
         COMMENTS_FIELD: "1,000",
         ENGAGEMENT_RATE_FIELD: "0.00",
+        ATTRIBUTED_CLICKS_FIELD: "1,000",
+        ATTRIBUTED_GMV_FIELD: "0.00",
+        ATTRIBUTED_ORDERS_FIELD: "1,000",
+        ATTRIBUTED_SALES_FIELD: "1,000",
     }
     for field_name, expected_formatter in expected_number_formatters.items():
         field = by_name.get(field_name) or {}

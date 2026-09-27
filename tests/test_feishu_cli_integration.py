@@ -138,7 +138,7 @@ def test_full_setup_dry_run_plans_without_preflight_writes(monkeypatch, capsys):
         return fake_context
 
     monkeypatch.setattr(workflow_main, "_create_feishu_context", fake_context_factory)
-    action = SimpleNamespace(kind="create_table", target="合作红人表", detail="18 个字段")
+    action = SimpleNamespace(kind="create_table", target="合作红人表", detail="20 个字段")
     monkeypatch.setattr(
         workflow_main,
         "_ensure_full_feishu_workspace",
@@ -185,7 +185,7 @@ def test_full_setup_dry_run_without_target_is_offline_and_creates_nothing(
     output = capsys.readouterr().out
     assert "离线计划" in output
     assert "7 张工作表" in output
-    assert "141 个" in output
+    assert "149 个" in output
     assert "本次未创建" in output
 
 
