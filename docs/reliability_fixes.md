@@ -124,3 +124,32 @@ $env:FEISHU_OPEN_BROWSER = "false"
 `output/live_validation/workflow_extra_info_metadata_redacted.json` 和
 `output/live_validation/workflow_extra_info_validation_redacted.json`。
 验收驱动和创建记录的清理凭据同样保存在 `output/live_validation/`，该目录按仓库规则忽略提交。
+
+## GitHub CI 与提交规则
+
+修复提交 [`3fe20b4`](https://github.com/SamHeee/yt-kol-workflow/commit/3fe20b493932c48711d8f9b203787bbc7a0ac23a)
+的 [GitHub Actions CI](https://github.com/SamHeee/yt-kol-workflow/actions/runs/39384588997)
+已于 2026-10-20 全部通过：
+
+| 必需检查 | 线上结果 |
+| --- | --- |
+| `tests (ubuntu-latest, 3.10)` | 通过 |
+| `tests (ubuntu-latest, 3.12)` | 通过 |
+| `tests (windows-latest, 3.10)` | 通过 |
+| `tests (windows-latest, 3.12)` | 通过 |
+
+每个组合均执行依赖安装、Python 编译和离线测试。线上 CI 验证代码与测试，
+飞书在线验收范围仍以独立实测报告为准。
+
+该修复提交此前已直接进入 `main`，上述 CI 为该提交的 push 检查结果。
+补充本文的后续 PR 记录线上验收及提交流程，不追溯改变原修复的提交方式。
+
+`main` 分支保护现对管理员同样生效：要求通过 PR 合并、以上四项检查成功、
+分支包含最新目标分支内容、解决所有评审对话，并保持线性历史。
+后续提交按以下步骤完成：
+
+1. 从最新 `main` 创建 `codex/` 前缀的工作分支，提交并推送改动。
+2. 创建以 `main` 为目标的 PR，说明变更范围和验证结果。
+3. 等待四项必需检查通过；检查失败时在同一分支修复并重新验证。
+4. 确认分支为最新且评审对话已解决后，以 squash 或 rebase 方式合并。
+5. 核对合并后的 `main` 提交及其 push CI 结果。
