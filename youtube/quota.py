@@ -72,6 +72,29 @@ class QuotaTracker:
         return "\n".join(lines)
 
 
+def estimate_channel_detail_cost(
+    channel_count: int,
+    use_playlist: bool = True,
+    recent_video_count: int = 10,
+) -> Dict[str, int]:
+    """Estimate Phase D calls, which fetch recent details per channel.
+
+    Recent-ID helpers currently return one page (at most 50 videos), so the
+    detail request is one videos.list call for each nonempty channel.  This is
+    an upper bound for channels that have fewer or no public uploads.
+    """
+    count = max(0, channel_count)
+    channel_detail = (count + 49) // 50 * QUOTA_COSTS["channels.list"]
+    recent_videos = count * QUOTA_COSTS["playlistItems.list" if use_playlist else "search.list"]
+    recent_video_detail = count * QUOTA_COSTS["videos.list"] if recent_video_count > 0 else 0
+    return {
+        "channel_detail": channel_detail,
+        "recent_videos": recent_videos,
+        "recent_video_detail": recent_video_detail,
+        "total": channel_detail + recent_videos + recent_video_detail,
+    }
+
+
 def estimate_single_keyword(
     max_results: int = 100,
     estimated_channels: int = 15,
@@ -99,17 +122,10 @@ def estimate_single_keyword(
             "total": total,
         }
 
-    channel_batches = (estimated_channels + 49) // 50
-    channel_cost = channel_batches * QUOTA_COSTS["channels.list"]
-
-    if use_playlist:
-        recent_videos_cost = estimated_channels * QUOTA_COSTS["playlistItems.list"]
-        recent_detail_batches = (estimated_channels * 10 + 49) // 50
-        recent_detail_cost = recent_detail_batches * QUOTA_COSTS["videos.list"]
-    else:
-        recent_videos_cost = estimated_channels * QUOTA_COSTS["search.list"]
-        recent_detail_batches = (estimated_channels * 10 + 49) // 50
-        recent_detail_cost = recent_detail_batches * QUOTA_COSTS["videos.list"]
+    detail = estimate_channel_detail_cost(estimated_channels, use_playlist=use_playlist)
+    channel_cost = detail["channel_detail"]
+    recent_videos_cost = detail["recent_videos"]
+    recent_detail_cost = detail["recent_video_detail"]
 
     total = search_cost + video_detail_cost + channel_cost + recent_videos_cost + recent_detail_cost
 

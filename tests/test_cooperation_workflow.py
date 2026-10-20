@@ -238,3 +238,64 @@ def test_builder_accepts_portable_name_only_options_and_validator_ignores_server
         enter_cooperation_option={"name": "进入合作"},
         initial_cooperation_status_option={"name": "待确认方案"},
     )
+
+
+def _trigger_field_refs(workflow):
+    """The five ValueInfo objects annotated in a real workflow-get response."""
+    steps = {step["id"]: step for step in workflow["steps"]}
+    branch_conditions = steps[BRANCH_STEP_ID]["data"]["condition"]["conditions"][0]["conditions"]
+    return [
+        steps[FIND_EXISTING_STEP_ID]["data"]["filter_info"]["conditions"][0]["value"][0],
+        branch_conditions[1]["left_value"],
+        branch_conditions[2]["left_value"],
+        steps[CREATE_STEP_ID]["data"]["field_values"][0]["value"][0],
+        steps[END_EXISTING_STEP_ID]["data"]["filter_info"]["conditions"][0]["value"][0],
+    ]
+
+
+def test_remote_trigger_field_ref_table_annotations_are_verified_and_normalized():
+    remote = _build()
+    for reference in _trigger_field_refs(remote):
+        reference["extra_info"] = {"table_name": "网红详情表"}
+    before = copy.deepcopy(remote)
+    _validate({"ok": True, "data": remote})
+    assert remote == before
+
+
+@pytest.mark.parametrize(
+    "extra_info",
+    [
+        {"table_name": "合作红人表"},
+        {"table_name": "网红详情表", "unknown_semantics": True},
+        {"table_name": "网红详情表", "field_name": "different field"},
+        {"table_name": None},
+        {},
+        None,
+        "网红详情表",
+    ],
+)
+def test_ref_table_normalization_rejects_unknown_or_conflicting_annotations(extra_info):
+    remote = _build()
+    _trigger_field_refs(remote)[0]["extra_info"] = extra_info
+    with pytest.raises(CooperationWorkflowValidationError, match="extra_info"):
+        _validate(remote)
+
+
+def test_correct_table_annotation_cannot_hide_a_changed_field_reference():
+    remote = _build()
+    reference = _trigger_field_refs(remote)[0]
+    reference.update(value="$.trigger_enter_cooperation.fld_wrong", extra_info={"table_name": "网红详情表"})
+    with pytest.raises(CooperationWorkflowValidationError):
+        _validate(remote)
+
+
+def test_source_table_annotations_on_other_refs_and_literals_remain_contract_errors():
+    for literal in (False, True):
+        remote = _build()
+        branch = next(step for step in remote["steps"] if step["id"] == BRANCH_STEP_ID)
+        value = branch["data"]["condition"]["conditions"][0]["conditions"][0]["left_value"]
+        if literal:
+            value.update(value=0, value_type="number")
+        value["extra_info"] = {"table_name": "网红详情表"}
+        with pytest.raises(CooperationWorkflowValidationError, match="extra_info"):
+            _validate(remote)

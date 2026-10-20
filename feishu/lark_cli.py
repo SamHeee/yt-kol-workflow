@@ -33,8 +33,9 @@ FULL_WORKSPACE_SCOPES = (
     "bitable:app",
     "base:workflow:create",
     "base:workflow:read",
+    # Official v1.0.70 and v1.0.88 Workflow shortcuts use update for both
+    # definition edits and enable/disable; no extra workflow:write is needed.
     "base:workflow:update",
-    "base:workflow:write",
 )
 
 # Only browser URLs owned by Feishu/Lark may be opened automatically.  Keep

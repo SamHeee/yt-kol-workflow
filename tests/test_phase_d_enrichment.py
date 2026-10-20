@@ -65,7 +65,7 @@ def test_phase_d_marks_activity_pending_on_recent_video_error(monkeypatch):
 
     details, _, error = phase_d_detail.run_phase_d("key", [_new_channel()])
 
-    assert error == ""
+    assert "temporary failure" in error
     assert details[0]["activity_status"] == "待确认"
     assert details[0]["latest_published_at"] == ""
 

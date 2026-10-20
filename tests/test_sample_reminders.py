@@ -10,8 +10,10 @@ import pytest
 
 from feishu.sample_logistics import (
     CARRIER_FIELD,
+    CARRIER_CODE_FIELD,
     CONTACT_EMAIL_FIELD,
     DELIVERED_DATE_FIELD,
+    PROVIDER_DELIVERED_AT_FIELD,
     KOL_NAME_FIELD,
     LAST_QUERIED_AT_FIELD,
     LATEST_EVENT_AT_FIELD,
@@ -54,6 +56,15 @@ from workflow.sample_reminders import (
 
 
 UTC = timezone.utc
+from logistics.shipment_identity import shipment_key
+
+
+def sync_identity(record):
+    fields = record["fields"]
+    fields[SYNCED_SHIPMENT_KEY_FIELD] = shipment_key(
+        "17track", fields.get(CARRIER_CODE_FIELD, ""), fields[TRACKING_NUMBER_FIELD]
+    )
+    return record
 
 
 def utc_ms(value):
@@ -139,11 +150,13 @@ def delivered_record(delivered_at, *, reminder_status="", reminder_key=""):
             SAMPLE_STATUS_FIELD: "已签收",
             LOGISTICS_STATUS_FIELD: "已签收",
             DELIVERED_DATE_FIELD: utc_ms(delivered_at),
+            PROVIDER_DELIVERED_AT_FIELD: utc_ms(delivered_at),
             LATEST_EVENT_AT_FIELD: utc_ms(delivered_at),
             LATEST_PROGRESS_FIELD: "Delivered, In/At Mailbox",
             CARRIER_FIELD: "DHL",
+            CARRIER_CODE_FIELD: "dhl",
             TRACKING_NUMBER_FIELD: "TRACK-001",
-            SYNCED_SHIPMENT_KEY_FIELD: "shipment-one",
+            SYNCED_SHIPMENT_KEY_FIELD: shipment_key("17track", "dhl", "TRACK-001"),
             REMINDER_STATUS_FIELD: reminder_status,
             REMINDER_EVENT_KEY_FIELD: reminder_key,
         },
@@ -165,8 +178,9 @@ def stagnant_record(started_at, source_synced_at, *, record_id="rec-stagnant"):
             LAST_QUERIED_AT_FIELD: utc_ms(source_synced_at),
             LATEST_PROGRESS_FIELD: "Departed origin facility",
             CARRIER_FIELD: "UPS",
+            CARRIER_CODE_FIELD: "ups",
             TRACKING_NUMBER_FIELD: "TRACK-002",
-            SYNCED_SHIPMENT_KEY_FIELD: "shipment-two",
+            SYNCED_SHIPMENT_KEY_FIELD: shipment_key("17track", "ups", "TRACK-002"),
         },
     }
 
@@ -199,6 +213,87 @@ def test_cancelled_sample_never_emits_stale_delivery_reminder():
 
     assert candidates == []
     assert skipped["sample_status_ineligible"] == 1
+
+
+@pytest.mark.parametrize("field,value", [(TRACKING_NUMBER_FIELD, "NEW-002"), (CARRIER_CODE_FIELD, "other")])
+def test_changed_shipment_cannot_use_old_delivery_snapshot(field, value):
+    now = datetime(2026, 8, 4, 9, 0, tzinfo=BEIJING_TZ)
+    record = delivered_record(now - timedelta(days=2))
+    record["fields"][field] = value
+    record["fields"][SAMPLE_STATUS_FIELD] = "已寄出"
+    candidates, skipped = plan_sample_reminders([record], now=now)
+    assert candidates == []
+    assert skipped["shipment_changed_or_unsynced"] == 1
+
+
+def test_legacy_manual_date_cannot_be_used_as_provider_delivery_time():
+    now = datetime(2026, 8, 4, 9, 0, tzinfo=BEIJING_TZ)
+    record = delivered_record(now - timedelta(days=2))
+    record["fields"].pop(PROVIDER_DELIVERED_AT_FIELD)
+    candidates, skipped = plan_sample_reminders([record], now=now)
+    assert candidates == []
+    assert skipped["delivered_time_missing"] == 1
+
+
+def test_delivery_reminder_uses_current_provider_time_not_old_manual_date():
+    now = datetime(2026, 8, 4, 9, 0, tzinfo=BEIJING_TZ)
+    record = delivered_record(now - timedelta(days=10))
+    record["fields"][PROVIDER_DELIVERED_AT_FIELD] = utc_ms(now - timedelta(hours=1))
+    candidates, skipped = plan_sample_reminders([record], now=now)
+    assert candidates == []
+    assert skipped["delivery_same_day"] == 1
+
+
+def test_backfilled_delivery_date_does_not_repeat_an_already_sent_parcel():
+    now = datetime(2026, 8, 4, 9, 0, tzinfo=BEIJING_TZ)
+    record = delivered_record(now - timedelta(days=10))
+    record["fields"][REMINDER_STATUS_FIELD] = REMINDER_SENT
+    record["fields"][REMINDER_TYPE_FIELD] = DELIVERY_REMINDER
+    record["fields"][REMINDER_EVENT_KEY_FIELD] = "historical-event-for-this-parcel"
+    record["fields"][PROVIDER_DELIVERED_AT_FIELD] = utc_ms(now - timedelta(days=2))
+    candidates, skipped = plan_sample_reminders([record], now=now)
+    assert candidates == []
+    assert skipped["already_sent"] == 1
+
+
+def test_number_changed_during_final_read_is_not_sent():
+    now = datetime(2026, 8, 4, 9, 0, tzinfo=BEIJING_TZ)
+    class ChangedClient(FakeClient):
+        def batch_get_records(self, table_id, record_ids):
+            self.records["rec-delivered"]["fields"][TRACKING_NUMBER_FIELD] = "NEW-002"
+            return super().batch_get_records(table_id, record_ids)
+    client = ChangedClient([delivered_record(now - timedelta(days=1))])
+    notifier = FakeNotifier()
+    result = dispatch_sample_reminders(
+        client=client, table_id="tbl-samples", notifier=notifier,
+        recipient_user_id="ou_recipient", now=now,
+    )
+    assert result["messages_sent"] == 0
+    assert client.update_calls == []
+    assert notifier.calls == []
+
+
+def test_changed_shipment_invalidates_crash_lease_instead_of_resending():
+    now = datetime(2026, 8, 4, 9, 0, tzinfo=BEIJING_TZ)
+    client = FakeClient([delivered_record(now - timedelta(days=1))])
+    class CrashNotifier(FakeNotifier):
+        def send_card(self, **kwargs):
+            raise SystemExit
+    with pytest.raises(SystemExit):
+        dispatch_sample_reminders(
+            client=client, table_id="tbl-samples", notifier=CrashNotifier(),
+            recipient_user_id="ou_recipient", now=now,
+        )
+    client.records["rec-delivered"]["fields"][TRACKING_NUMBER_FIELD] = "NEW-002"
+    notifier = FakeNotifier()
+    result = dispatch_sample_reminders(
+        client=client, table_id="tbl-samples", notifier=notifier,
+        recipient_user_id="ou_recipient", now=now + timedelta(minutes=31),
+    )
+    assert result["messages_sent"] == 0
+    assert result["skipped_counts"]["invalid_sending_lease_manual_confirmation"] == 1
+    assert client.records["rec-delivered"]["fields"][REMINDER_STATUS_FIELD] == REMINDER_MANUAL
+    assert notifier.calls == []
 
 
 def test_stagnation_requires_72_hours_and_fresh_provider_data():
@@ -605,7 +700,7 @@ def test_targeted_sample_ids_and_limit_are_applied_before_dry_run_plan():
     second = copy.deepcopy(first)
     second["record_id"] = "rec-second"
     second["fields"][SAMPLE_RECORD_ID_FIELD] = "SMP-000099"
-    second["fields"][SYNCED_SHIPMENT_KEY_FIELD] = "shipment-99"
+    sync_identity(second)
     client = FakeClient([first, second])
 
     only_second = dispatch_sample_reminders(
@@ -721,7 +816,7 @@ def test_stale_lease_reuses_original_key_and_excludes_new_candidates():
     new_record = delivered_record(now - timedelta(days=2))
     new_record["record_id"] = "rec-new-due"
     new_record["fields"][SAMPLE_RECORD_ID_FIELD] = "SMP-NEW-DUE"
-    new_record["fields"][SYNCED_SHIPMENT_KEY_FIELD] = "shipment-new"
+    sync_identity(new_record)
     client.records[new_record["record_id"]] = copy.deepcopy(new_record)
 
     retry_notifier = FakeNotifier()
@@ -775,6 +870,7 @@ def test_full_short_tracking_number_is_rendered_and_table_link_is_sanitized():
     now = datetime(2026, 8, 4, 9, 0, tzinfo=BEIJING_TZ)
     record = delivered_record(now - timedelta(days=1))
     record["fields"][TRACKING_NUMBER_FIELD] = "ABC"
+    sync_identity(record)
     candidates, _ = plan_sample_reminders([record], now=now)
 
     markdown = build_daily_reminder_markdown(
@@ -804,6 +900,7 @@ def test_full_tracking_number_is_not_truncated_by_long_carrier_text():
     full_tracking_number = "9" * 240
     record["fields"][CARRIER_FIELD] = "C" * 240
     record["fields"][TRACKING_NUMBER_FIELD] = full_tracking_number
+    sync_identity(record)
     candidates, _ = plan_sample_reminders([record], now=now)
 
     markdown = build_daily_reminder_markdown(candidates, now=now)
@@ -820,6 +917,7 @@ def test_tracking_number_and_progress_variants_are_not_redacted():
         now - timedelta(hours=1),
     )
     record["fields"][TRACKING_NUMBER_FIELD] = "TRACK-001"
+    sync_identity(record)
     record["fields"][LATEST_PROGRESS_FIELD] = (
         "carrier echoed track-001, TRACK 001, T.R.A.C.K_0/0:1, "
         "TRACK–001 and TRACK#001"

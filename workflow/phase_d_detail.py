@@ -50,13 +50,14 @@ def run_phase_d(
 
     # ---- D-1: Channel details ----
     channel_ids = [c["channel_id"] for c in new_channels]
+    saved_details, saved_videos = state.channel_payloads() if state else ([], [])
 
     # Filter out already-done channels (for resume)
     if state:
         channel_ids = state.get_remaining_channels(channel_ids)
         if not channel_ids:
             logger.info("所有频道已在之前完成，跳过阶段D")
-            return [], [], ""
+            return saved_details, saved_videos, ""
         logger.info(f"续传: 还有 {len(channel_ids)} 个频道待处理")
 
     channels_data, error = fetch_channel_details(
@@ -67,7 +68,12 @@ def run_phase_d(
 
     if error:
         logger.error(f"频道详情获取失败: {error}")
-        return [], [], error
+        return saved_details, saved_videos, error
+
+    returned_ids = {item["channel_id"] for item in channels_data}
+    if state:
+        for missing_id in set(channel_ids) - returned_ids:
+            state.commit_channel(missing_id, outcome="unavailable")
 
     # Add email extraction
     for ch in channels_data:
@@ -87,11 +93,11 @@ def run_phase_d(
     )
     if not channels_data:
         logger.info("频道级筛选后无可抓取频道")
-        return [], [], ""
+        return saved_details, saved_videos, ""
 
     # Enrich with representative video info from Phase C
     channel_to_new = {c["channel_id"]: c for c in new_channels}
-    influencer_details = []
+    influencer_details = list(saved_details)
     for ch in channels_data:
         cid = ch["channel_id"]
         nc = channel_to_new.get(cid, {})
@@ -125,7 +131,8 @@ def run_phase_d(
     }
 
     # ---- D-2: Recent videos for each channel ----
-    all_influencer_videos = []
+    all_influencer_videos = list(saved_videos)
+    errors = []
 
     for ch in channels_data:
         cid = ch["channel_id"]
@@ -156,15 +163,14 @@ def run_phase_d(
                 logger.error(f"获取频道 {ctitle} 最近视频时配额耗尽: {err}")
                 return influencer_details, all_influencer_videos, err
             logger.warning(f"获取频道 {ctitle} 最近视频失败: {err}")
-            if state:
-                state.mark_channel_done(cid)
+            errors.append(f"{cid}: {err}")
             continue
 
         if not video_ids:
             logger.warning(f"频道 {ctitle} 无最近视频")
             detail.update(evaluate_channel_activity([]))
             if state:
-                state.mark_channel_done(cid)
+                state.commit_channel(cid, detail, [])
             continue
 
         # Fetch video details
@@ -180,6 +186,8 @@ def run_phase_d(
                 logger.error(f"频道 {ctitle} 视频详情获取时配额耗尽: {err}")
                 return influencer_details, all_influencer_videos, err
             logger.warning(f"频道 {ctitle} 视频详情获取失败: {err}")
+            errors.append(f"{cid}: {err}")
+            continue
         else:
             # Enrich with channel title
             for v in videos:
@@ -194,7 +202,7 @@ def run_phase_d(
             )
 
         if state:
-            state.mark_channel_done(cid)
+            state.commit_channel(cid, detail, videos)
 
         logger.debug(f"频道 {ctitle}: {len(videos)} 个最近视频")
 
@@ -203,7 +211,7 @@ def run_phase_d(
         f"{len(all_influencer_videos)} 个最近视频"
     )
 
-    return influencer_details, all_influencer_videos, ""
+    return influencer_details, all_influencer_videos, "; ".join(errors)
 
 
 def _is_quota_error(error: str) -> bool:

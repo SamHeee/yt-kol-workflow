@@ -85,11 +85,7 @@ class BitableClient:
 
     def list_tables(self) -> List[Dict]:
         """List all tables in the bitable."""
-        result = self._get("/tables")
-        if result.get("code") != 0:
-            logger.error(f"列表数据表失败: {result.get('msg')}")
-            return []
-        return result.get("data", {}).get("items", [])
+        return self._list_items("/tables", page_size=100, label="列表数据表")
 
     def create_table(self, name: str) -> Optional[str]:
         """Create a new table. Returns table_id or None."""
@@ -134,11 +130,9 @@ class BitableClient:
 
     def list_fields(self, table_id: str) -> List[Dict]:
         """List all fields in a table."""
-        result = self._get(f"/tables/{table_id}/fields")
-        if result.get("code") != 0:
-            logger.error(f"列表字段失败: {result.get('msg')}")
-            return []
-        return result.get("data", {}).get("items", [])
+        return self._list_items(
+            f"/tables/{table_id}/fields", page_size=100, label="列表字段"
+        )
 
     def create_field(self, table_id: str, name: str, field_type: int = 1) -> Optional[str]:
         """Create a field.
@@ -200,30 +194,80 @@ class BitableClient:
 
     def get_all_records(self, table_id: str, page_size: int = 500) -> List[Dict]:
         """Get all records with pagination."""
-        all_records = []
-        page_token = ""
+        if (
+            isinstance(page_size, bool)
+            or not isinstance(page_size, int)
+            or not 1 <= page_size <= 500
+        ):
+            raise ValueError("page_size must be an integer between 1 and 500")
+        return self._list_items(
+            f"/tables/{table_id}/records", page_size=page_size, label="读取记录"
+        )
 
+    def _list_items(self, path: str, *, page_size: int, label: str) -> List[Dict]:
+        """Read every page or fail without exposing an incomplete inventory."""
+        items: List[Dict] = []
+        page_token = ""
+        seen_tokens = set()
+        expected_total = None
         while True:
             params = {"page_size": page_size}
             if page_token:
                 params["page_token"] = page_token
-
-            result = self._get(f"/tables/{table_id}/records", params)
-            if result.get("code") != 0:
-                logger.error(f"读取记录失败: {result.get('msg')}")
-                break
-
-            # Feishu returns ``items: null`` for a table with no records.
-            # Normalize that wire representation to the public list contract.
-            records = result.get("data", {}).get("items") or []
-            all_records.extend(records)
-
-            has_more = result.get("data", {}).get("has_more", False)
-            page_token = result.get("data", {}).get("page_token", "")
-            if not has_more or not page_token:
-                break
-
-        return all_records
+            result = self._get(path, params)
+            if not isinstance(result, dict) or result.get("code") != 0:
+                code = result.get("code") if isinstance(result, dict) else "invalid response"
+                # API messages may echo field values or credentials.
+                raise RuntimeError(f"{label}失败 (code={code!r})")
+            data = result.get("data")
+            if not isinstance(data, dict):
+                raise RuntimeError(f"{label}返回无效的 data 对象")
+            has_more = data.get("has_more", False)
+            if not isinstance(has_more, bool):
+                raise RuntimeError(f"{label}返回无效的 has_more")
+            if "items" not in data:
+                # The raw Bitable API can omit items entirely for an empty
+                # table. Accept only its explicitly confirmed first-page
+                # empty representation, never an unknown or truncated page.
+                if (
+                    not page_token
+                    and type(data.get("total")) is int
+                    and data["total"] == 0
+                    and data.get("has_more") is False
+                ):
+                    page = []
+                else:
+                    raise RuntimeError(f"{label}返回缺少 items 列表")
+            else:
+                page = data["items"]
+            # Empty tables use null on the wire. Require explicit evidence of
+            # emptiness; unknown/malformed payloads must never become [].
+            if page is None and not has_more and (
+                (type(data.get("total")) is int and data["total"] == 0)
+                or ("total" not in data and data.get("has_more") is False)
+            ):
+                page = []
+            if not isinstance(page, list) or not all(isinstance(item, dict) for item in page):
+                raise RuntimeError(f"{label}返回无效的 items 列表")
+            total = data.get("total", expected_total)
+            if total is not None:
+                if type(total) is not int or total < len(items) + len(page):
+                    raise RuntimeError(f"{label}返回无效的 total")
+                if expected_total is not None and total != expected_total:
+                    raise RuntimeError(f"{label}分页期间总数发生变化，请重试读取")
+                expected_total = total
+            items.extend(page)
+            if not has_more:
+                if total is not None and len(items) != total:
+                    raise RuntimeError(f"{label}返回不完整的分页结果")
+                return items
+            if total is not None and len(items) >= total:
+                raise RuntimeError(f"{label}返回矛盾的分页标记")
+            next_token = data.get("page_token")
+            if not isinstance(next_token, str) or not next_token.strip() or next_token in seen_tokens:
+                raise RuntimeError(f"{label}分页游标缺失或重复")
+            seen_tokens.add(next_token)
+            page_token = next_token
 
     def batch_get_records(
         self,
@@ -404,6 +448,7 @@ class BitableClient:
     def batch_delete_records(self, table_id: str, record_ids: List[str]) -> int:
         """Batch delete records by record_id (max 500 per call)."""
         total_deleted = 0
+        record_ids = list(dict.fromkeys(rid for rid in record_ids if rid))
 
         for i in range(0, len(record_ids), 500):
             batch = [rid for rid in record_ids[i:i + 500] if rid]
@@ -418,7 +463,22 @@ class BitableClient:
                 logger.error(f"批量删除记录失败: {result.get('msg')}")
                 raise RuntimeError(f"批量删除记录失败: {result.get('msg')}")
 
-            total_deleted += len(batch)
+            data = result.get("data")
+            deleted_records = data.get("records") if isinstance(data, dict) else None
+            if not isinstance(deleted_records, list):
+                raise RuntimeError("批量删除记录未返回逐条删除确认")
+            confirmations = {}
+            for record in deleted_records:
+                record_id = record.get("record_id") if isinstance(record, dict) else None
+                if not isinstance(record_id, str) or record_id not in batch or record_id in confirmations:
+                    raise RuntimeError("批量删除记录返回无效或重复的删除确认")
+                confirmations[record_id] = record.get("deleted") is True
+            confirmed = sum(confirmations.values())
+            if len(confirmations) != len(batch) or confirmed != len(batch):
+                raise RuntimeError(
+                    f"批量删除记录未全部确认: requested={len(batch)}, confirmed={confirmed}"
+                )
+            total_deleted += confirmed
             logger.debug(f"批量删除 batch {i//500+1}: {len(batch)} 条")
 
             if i + 500 < len(record_ids):

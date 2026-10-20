@@ -186,6 +186,71 @@ def test_typed_list_helpers(invoke, shortcut, tail, resource):
     assert process.calls[0][0] == expected_prefix(shortcut) + tail
 
 
+def test_workflow_list_accepts_confirmed_null_empty_result():
+    process = RecordingRunner([completed({"ok": True, "data": {"items": None, "total": 0}})])
+    assert make_runner(process).list_workflows() == []
+
+
+@pytest.mark.parametrize("payload", [
+    {}, {"items": None}, {"items": None, "total": 1},
+    {"items": None, "total": False}, {"items": None, "total": 0, "has_more": True},
+    {"items": [None], "total": 1},
+])
+def test_workflow_list_rejects_unconfirmed_empty_or_malformed_result(payload):
+    process = RecordingRunner([completed({"ok": True, "data": payload})])
+    with pytest.raises(LarkCliBaseResponseError):
+        make_runner(process).list_workflows()
+
+
+@pytest.mark.parametrize("method,args,resource", [
+    ("list_tables", (), "tables"), ("list_fields", ("tbl",), "fields"),
+    ("list_views", ("tbl",), "views"),
+])
+def test_metadata_lists_follow_offsets_until_total_is_read(method, args, resource):
+    process = RecordingRunner([
+        completed({"ok": True, "data": {"items": [{"id": "first"}], "total": 2}}),
+        completed({"ok": True, "data": {resource: [{"id": "second"}], "total": 2}}),
+    ])
+    assert getattr(make_runner(process), method)(*args) == [{"id": "first"}, {"id": "second"}]
+    assert process.calls[1][0][-2:] == ["--offset", "1"]
+
+
+def test_list_with_unknown_total_continues_after_full_default_page():
+    first = [{"table_id": str(i)} for i in range(50)]
+    process = RecordingRunner([
+        completed({"ok": True, "data": {"items": first}}),
+        completed({"ok": True, "data": {"items": [{"table_id": "last"}]}}),
+    ])
+    assert len(make_runner(process).list_tables()) == 51
+    assert process.calls[1][0][-2:] == ["--offset", "50"]
+
+
+@pytest.mark.parametrize("second", [
+    {"items": [], "total": 2},
+    {"items": [{"id": "first"}], "total": 2},
+    {"items": [{"id": "second"}], "total": 3},
+    {"items": [{"id": "second"}], "total": 1},
+    {"items": [], "has_more": True},
+])
+def test_incomplete_or_repeated_metadata_pages_raise(second):
+    process = RecordingRunner([
+        completed({"ok": True, "data": {"items": [{"id": "first"}], "total": 2}}),
+        completed({"ok": True, "data": second}),
+    ])
+    with pytest.raises(LarkCliBaseResponseError):
+        make_runner(process).list_tables()
+    assert len(process.calls) == 2
+
+
+def test_second_metadata_page_error_never_returns_partial_result():
+    process = RecordingRunner([
+        completed({"ok": True, "data": {"items": [{"id": "first"}], "total": 2}}),
+        completed({"ok": False, "error": {"code": "denied", "message": "no access"}}),
+    ])
+    with pytest.raises(LarkCliBaseCommandError):
+        make_runner(process).list_tables()
+
+
 def test_mvp_exposes_only_the_single_view_order_write_method():
     cli = make_runner(RecordingRunner([]))
 

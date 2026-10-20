@@ -9,6 +9,7 @@ definitions use the CLI's documented, typed Base shortcuts.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 import uuid
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
@@ -60,23 +61,37 @@ def _payload_items(payload: Any, *keys: str) -> List[dict]:
     """Extract a list from common lark-cli response envelopes."""
 
     value = payload
-    if isinstance(value, Mapping) and value.get("ok") is True:
+    if isinstance(value, Mapping) and "ok" in value:
+        if value.get("ok") is not True:
+            raise ProvisioningError("lark-cli rejected the list request")
         value = value.get("data")
     if isinstance(value, list):
-        return [dict(item) for item in value if isinstance(item, Mapping)]
+        if not all(isinstance(item, Mapping) for item in value):
+            raise ProvisioningError("lark-cli returned an invalid list item")
+        return [dict(item) for item in value]
     if not isinstance(value, Mapping):
         raise ProvisioningError("lark-cli returned an unexpected non-object response")
+    if "code" in value and value.get("code") not in (0, "0"):
+        raise ProvisioningError("lark-cli returned a failed API list response")
     for key in (*keys, "items"):
+        if key not in value:
+            continue
         candidate = value.get(key)
         if isinstance(candidate, list):
-            return [dict(item) for item in candidate if isinstance(item, Mapping)]
+            return _payload_items(candidate, *keys)
+        if (
+            candidate is None
+            and type(value.get("total")) is int
+            and value["total"] == 0
+            and value.get("has_more", False) is False
+        ):
+            return []
+        raise ProvisioningError("lark-cli returned an invalid list")
     for container in ("data", "result"):
         nested = value.get(container)
-        if isinstance(nested, Mapping):
-            found = _payload_items(nested, *keys)
-            if found or any(key in nested for key in (*keys, "items")):
-                return found
-    return []
+        if isinstance(nested, (Mapping, list)):
+            return _payload_items(nested, *keys)
+    raise ProvisioningError("lark-cli response did not contain a list")
 
 
 def _table_name(item: Mapping[str, Any]) -> str:
@@ -291,6 +306,17 @@ def _audit_select_options(
         target_names.append(name)
 
     missing = [name for name in target_names if name not in seen]
+    if "default_value" in existing:
+        default = existing["default_value"]
+        if default is not None:
+            if not isinstance(default, list) or any(
+                not isinstance(name, str) or name not in seen for name in default
+            ):
+                errors.append("单选默认值必须为已有选项名称数组或 null")
+            elif len(default) != len(set(default)) or (
+                not existing.get("multiple", False) and len(default) > 1
+            ):
+                errors.append("单选默认值数量或重复项无效")
     return missing, errors
 
 
@@ -306,7 +332,7 @@ def _select_update_payload(
         raise ProvisioningConflict("字段定义缺少单选项")
     payload_options: List[Dict[str, Any]] = []
     for option in options:
-        # IDs and field/default metadata are read-only in the typed CLI JSON.
+        # Option IDs are read-only in the typed CLI JSON.
         # Matching names let Feishu retain existing option identities while
         # visual properties and unmanaged options remain unchanged.
         item: Dict[str, Any] = {"name": str(option["name"])}
@@ -325,6 +351,8 @@ def _select_update_payload(
     description = existing.get("description")
     if description is not None:
         payload["description"] = description
+    if "default_value" in existing:
+        payload["default_value"] = deepcopy(existing["default_value"])
     return payload
 
 
@@ -721,6 +749,11 @@ class SevenTableProvisioner:
                     raise ProvisioningError(
                         f"单选项补齐后回读不一致: {table_spec.name}.{field_spec.name}"
                     )
+                for key in ("description", "default_value"):
+                    if key in payload and (key not in updated or updated[key] != payload[key]):
+                        raise ProvisioningError(
+                            f"单选项补齐后 {key} 未保留: {table_spec.name}.{field_spec.name}"
+                        )
 
     def ensure_workflow_enabled(self) -> tuple[str, bool]:
         """Strictly validate the managed Workflow and enable it if needed."""

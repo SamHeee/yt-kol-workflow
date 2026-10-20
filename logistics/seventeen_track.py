@@ -279,6 +279,8 @@ def _source_sync_outcome(
 def _rejection_status(code: Any, message: Any) -> TrackingSyncStatus:
     code_text = str(code or "")
     normalized = str(message or "").lower()
+    if "already registered" in normalized or "already been registered" in normalized:
+        return TrackingSyncStatus.REGISTERED
     if code_text == "-18010012" or ("format" in normalized and "invalid" in normalized):
         return TrackingSyncStatus.INVALID_NUMBER
     if code_text == "-18019903" or "carrier cannot be detected" in normalized:
@@ -446,12 +448,31 @@ class SeventeenTrackClient:
 
         results: list[TrackingResult] = []
         for batch in _chunks(items, self.batch_size):
-            body = self._post(
-                endpoint,
-                [_request_payload(item) for item in batch],
-                tracking_numbers=[item.number for item in batch],
-            )
-            results.extend(parser(body, batch))
+            try:
+                body = self._post(
+                    endpoint,
+                    [_request_payload(item) for item in batch],
+                    tracking_numbers=[item.number for item in batch],
+                )
+                results.extend(parser(body, batch))
+            except LogisticsProviderError as exc:
+                # Keep the established typed exception contract for one
+                # batch, but never discard successful independent batches.
+                if len(items) <= self.batch_size:
+                    raise
+                message = _sanitize_error(
+                    str(exc), api_key=self._api_key,
+                    tracking_numbers=[item.number for item in batch],
+                )
+                results.extend(
+                    TrackingResult(
+                        number=item.number,
+                        carrier=_carrier_text(item.carrier),
+                        sync_status=TrackingSyncStatus.API_ERROR,
+                        error_message=message,
+                    )
+                    for item in batch
+                )
         return results
 
     def _response_items(self, body: Mapping[str, Any]) -> tuple[list[Any], list[Any]]:
@@ -595,5 +616,36 @@ class SeventeenTrackClient:
 
         items = list(tracking_requests)
         if register_first:
-            self.register(items)
+            registrations = self.register(items)
+            failures = [
+                result for result in registrations
+                if result.sync_status is not TrackingSyncStatus.REGISTERED
+            ]
+            failed_keys = {(result.number, result.carrier) for result in failures}
+            query_items = [
+                item for item in items
+                if not any(
+                    number == item.number and (
+                        not carrier or not item.carrier
+                        or carrier == _carrier_text(item.carrier)
+                    )
+                    for number, carrier in failed_keys
+                )
+            ]
+            try:
+                return failures + self.get_track_info(query_items)
+            except LogisticsProviderError as exc:
+                if not failures:
+                    raise
+                return failures + [
+                    TrackingResult(
+                        number=item.number, carrier=_carrier_text(item.carrier),
+                        sync_status=TrackingSyncStatus.API_ERROR,
+                        error_message=_sanitize_error(
+                            str(exc), api_key=self._api_key,
+                            tracking_numbers=[request.number for request in query_items],
+                        ),
+                    )
+                    for item in query_items
+                ]
         return self.get_track_info(items)

@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -15,6 +16,10 @@ import pandas as pd
 from export import excel_exporter
 from feishu import schema as feishu_schema
 from feishu.value_utils import clean_text, is_blank
+from filter.activity_evaluator import evaluate_channel_activity
+
+
+_OBSERVATION_TIME = "__observation_time__"
 
 
 # Kept as a public compatibility constant.  These columns now live only in the
@@ -131,6 +136,22 @@ def _read_excel_rows(path: Path) -> Tuple[List[str], List[Dict[str, Any]]]:
     return headers, df.to_dict(orient="records")
 
 
+def _observation_time(path: Path) -> float:
+    """Prefer the run timestamp over copy-sensitive file modification times.
+
+    Run folder timestamps share the same local clock; treating their ordering
+    as UTC is deliberate here because only their relative order is used.
+    """
+    for part in reversed(path.parts[:-1]):
+        match = re.search(r"(?<!\d)(\d{8}_\d{6})(?!\d)", part)
+        if match:
+            try:
+                return datetime.strptime(match.group(1), "%Y%m%d_%H%M%S").replace(tzinfo=timezone.utc).timestamp()
+            except ValueError:
+                continue
+    return path.stat().st_mtime
+
+
 def _normalize_source_row(table_key: str, source_row: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize a current or legacy row to the exact Feishu Excel contract."""
     expected_headers = TABLE_SPECS[table_key]["expected_headers"]
@@ -197,8 +218,12 @@ def _collect_table_rows(
             files.append(str(source_file.resolve()))
             recognized_headers = set(headers) | set(LEGACY_HEADER_ALIASES.get(table_key, {}))
             ignored_headers.update(header for header in source_headers if header not in recognized_headers)
+            observed_at = _observation_time(source_file) if table_key == "influencers" else None
             for source_row in source_rows:
-                rows.append(_normalize_source_row(table_key, source_row))
+                normalized = _normalize_source_row(table_key, source_row)
+                if table_key == "influencers":
+                    normalized[_OBSERVATION_TIME] = observed_at
+                rows.append(normalized)
             provenance_rows.append({
                 "数据表": table_key,
                 "来源批次": batch_dir.name,
@@ -225,6 +250,7 @@ def _dedupe_rows(
     key_column: str,
     *,
     merge_nonblank: bool = False,
+    now: Optional[datetime] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     seen: Dict[str, Dict[str, Any]] = {}
     deduped: List[Dict[str, Any]] = []
@@ -240,11 +266,14 @@ def _dedupe_rows(
         if key in seen:
             duplicate_rows += 1
             if merge_nonblank:
-                _merge_influencer_row(seen[key], row)
+                _merge_influencer_row(seen[key], row, now=now)
             continue
         seen[key] = row
         deduped.append(row)
 
+    if merge_nonblank:
+        for row in deduped:
+            _refresh_activity_status(row, now=now)
     return deduped, {
         "dedupe_key": key_column,
         "unique_keys": len(seen),
@@ -253,7 +282,9 @@ def _dedupe_rows(
     }
 
 
-def _merge_influencer_row(target: Dict[str, Any], incoming: Dict[str, Any]) -> None:
+def _merge_influencer_row(
+    target: Dict[str, Any], incoming: Dict[str, Any], *, now: Optional[datetime] = None,
+) -> None:
     """Merge a newer duplicate without letting legacy blank columns win.
 
     The summary builder frequently combines old workbooks (which predate the
@@ -270,14 +301,40 @@ def _merge_influencer_row(target: Dict[str, Any], incoming: Dict[str, Any]) -> N
     incoming_latest = pd.to_datetime(incoming.get("最新发布日期"), errors="coerce", utc=True)
     if pd.notna(incoming_latest) and (pd.isna(current_latest) or incoming_latest > current_latest):
         target["最新发布日期"] = incoming.get("最新发布日期")
+
+    current_observed = target.get(_OBSERVATION_TIME)
+    incoming_observed = incoming.get(_OBSERVATION_TIME)
+    incoming_is_newer = (
+        incoming_observed is not None
+        and (current_observed is None or incoming_observed > current_observed)
+    )
+    if current_observed is None and incoming_observed is None:
+        incoming_is_newer = pd.notna(incoming_latest) and (
+            pd.isna(current_latest) or incoming_latest >= current_latest
+        )
+    if incoming_is_newer:
+        if incoming_observed is not None:
+            target[_OBSERVATION_TIME] = incoming_observed
         if not is_blank(incoming.get("断更评估")):
-            target["断更评估"] = incoming.get("断更评估")
+            target["断更评估"] = incoming["断更评估"]
 
     for column, value in incoming.items():
-        if column == "KOL Name":
+        if column in {"KOL Name", "最新发布日期", "断更评估", _OBSERVATION_TIME}:
             continue
         if is_blank(target.get(column)) and not is_blank(value):
             target[column] = value
+    _refresh_activity_status(target, now=now)
+
+
+def _refresh_activity_status(row: Dict[str, Any], *, now: Optional[datetime] = None) -> None:
+    """Age conclusive observations at merge time; preserve a latest fetch failure."""
+    if clean_text(row.get("断更评估")) == "待确认":
+        return
+    latest = pd.to_datetime(row.get("最新发布日期"), errors="coerce", utc=True)
+    if pd.isna(latest):
+        return
+    activity = evaluate_channel_activity([{"published_at_raw": latest.isoformat()}], now=now)
+    row["断更评估"] = activity["activity_status"]
 
 
 def _normalize_cell(value: Any, field_type: Optional[int] = None) -> Any:
@@ -359,6 +416,10 @@ def build_summary_workbook(
                 "blank_key_rows_kept": 0,
                 "missing_dedupe_key": True,
             })
+
+        if table_key == "influencers" and not dedupe:
+            for row in rows:
+                _refresh_activity_status(row)
 
         stats["output_rows"] = len(rows)
         tables[table_key] = {"headers": headers, "rows": rows}

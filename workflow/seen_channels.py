@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, Set
 
+from workflow.persistence import atomic_write_json
+
 logger = logging.getLogger("kol_workflow.workflow.seen_channels")
 
 
@@ -45,7 +47,7 @@ class SeenChannelStore:
     def __init__(self, filepath: str):
         self.filepath = Path(filepath)
         self.data = {
-            "version": 1,
+            "version": 2,
             "updated_at": "",
             "channels": {},
         }
@@ -61,17 +63,41 @@ class SeenChannelStore:
                 self.data["version"] = data.get("version", 1)
                 self.data["updated_at"] = data.get("updated_at", "")
                 self.data["channels"] = data.get("channels", {}) or {}
+                if self.data["version"] < 2:
+                    logger.warning(
+                        "旧频道库中的 %s 个 ID 缺少详情完成凭据，将保留记录并重新核验。",
+                        len(self.data["channels"]),
+                    )
         except Exception as exc:
             logger.warning(f"读取持久频道库失败: {exc}")
 
     def save(self):
         self.filepath.parent.mkdir(parents=True, exist_ok=True)
         self.data["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        with open(self.filepath, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
+        self.data["version"] = 2
+        atomic_write_json(self.filepath, self.data)
 
     def ids(self) -> Set[str]:
-        return set(self.data.get("channels", {}).keys())
+        return {
+            cid for cid, value in self.data.get("channels", {}).items()
+            if isinstance(value, dict) and value.get("processing_status") == "complete"
+        }
+
+    def pending_ids(self) -> Set[str]:
+        return set(self.data.get("channels", {})) - self.ids()
+
+    def mark_pending(self, channels: Iterable[Dict]):
+        store = self.data.setdefault("channels", {})
+        completed = self.ids()
+        for channel in channels:
+            cid = channel.get("channel_id")
+            if cid and cid not in completed:
+                store[cid] = {
+                    **store.get(cid, {}),
+                    "channel_id": cid,
+                    "processing_status": "pending",
+                }
+        self.save()
 
     def mark_channels(self, channels: Iterable[Dict], source_keyword: str = ""):
         now = datetime.now().isoformat(timespec="seconds")
@@ -92,6 +118,7 @@ class SeenChannelStore:
 
             rep = ch.get("representative_video", {})
             store[channel_id] = {
+                "processing_status": "complete",
                 "channel_id": channel_id,
                 "channel_title": ch.get("channel_title") or existing.get("channel_title", ""),
                 "first_seen_at": first_seen_at,

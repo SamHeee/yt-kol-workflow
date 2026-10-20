@@ -159,8 +159,7 @@ class LarkCliBaseRunner:
     # ----- strictly read-only table/field/view/workflow helpers -----
 
     def list_tables(self) -> list[dict[str, Any]]:
-        data = self._execute_json(self._base_command("+table-list"), "list tables")
-        return self._extract_items(data, "tables")
+        return self._execute_list(self._base_command("+table-list"), "list tables", "tables")
 
     def get_table(self, table_id_or_name: str) -> dict[str, Any]:
         target = self._required_text(table_id_or_name, "table_id_or_name")
@@ -171,10 +170,9 @@ class LarkCliBaseRunner:
 
     def list_fields(self, table_id_or_name: str) -> list[dict[str, Any]]:
         table = self._required_text(table_id_or_name, "table_id_or_name")
-        data = self._execute_json(
-            self._base_command("+field-list", "--table-id", table), "list fields"
+        return self._execute_list(
+            self._base_command("+field-list", "--table-id", table), "list fields", "fields"
         )
-        return self._extract_items(data, "fields")
 
     def get_field(
         self, table_id_or_name: str, field_id_or_name: str
@@ -195,10 +193,9 @@ class LarkCliBaseRunner:
 
     def list_views(self, table_id_or_name: str) -> list[dict[str, Any]]:
         table = self._required_text(table_id_or_name, "table_id_or_name")
-        data = self._execute_json(
-            self._base_command("+view-list", "--table-id", table), "list views"
+        return self._execute_list(
+            self._base_command("+view-list", "--table-id", table), "list views", "views"
         )
-        return self._extract_items(data, "views")
 
     def get_view(
         self, table_id_or_name: str, view_id_or_name: str
@@ -474,6 +471,46 @@ class LarkCliBaseRunner:
 
     # ----- subprocess and response safety -----
 
+    def _execute_list(
+        self, command: list[str], label: str, resource_name: str
+    ) -> list[dict[str, Any]]:
+        """Follow the typed table/field/view shortcuts' offset pagination."""
+        items: list[dict[str, Any]] = []
+        seen_pages: set[str] = set()
+        expected_total: int | None = None
+        while True:
+            page_command = command + (["--offset", str(len(items))] if items else [])
+            data = self._execute_json(page_command, label)
+            page = self._extract_items(data, resource_name)
+            total = data.get("total", expected_total) if isinstance(data, Mapping) else expected_total
+            has_more = data.get("has_more") if isinstance(data, Mapping) else None
+            if total is not None:
+                if type(total) is not int or total < len(items) + len(page):
+                    raise LarkCliBaseResponseError(f"{label} returned an invalid total")
+                if expected_total is not None and total != expected_total:
+                    raise LarkCliBaseResponseError(f"{label} inventory changed during pagination")
+                expected_total = total
+            if has_more is not None and not isinstance(has_more, bool):
+                raise LarkCliBaseResponseError(f"{label} returned an invalid has_more")
+            if page:
+                signature = json.dumps(page, sort_keys=True, ensure_ascii=False)
+                if signature in seen_pages:
+                    raise LarkCliBaseResponseError(f"{label} repeated a pagination page")
+                seen_pages.add(signature)
+            items.extend(page)
+            incomplete = total is not None and len(items) < total
+            # Older shortcuts can omit total/has_more. A full default-sized
+            # page is insufficient evidence of completion; request the next
+            # offset and stop only after a short page.
+            if total is None and has_more is None and isinstance(data, Mapping):
+                incomplete = len(page) >= (50 if resource_name == "tables" else 100)
+            if has_more is False and incomplete:
+                raise LarkCliBaseResponseError(f"{label} returned inconsistent pagination metadata")
+            if not incomplete and has_more is not True:
+                return items
+            if not page:
+                raise LarkCliBaseResponseError(f"{label} pagination made no progress")
+
     def _base_command(self, shortcut: str, *extra: str) -> list[str]:
         return [
             self.cli_path,
@@ -709,6 +746,15 @@ class LarkCliBaseRunner:
                 candidate = data.get(key)
                 if isinstance(candidate, list):
                     items = candidate
+                    break
+                if (
+                    key in data
+                    and candidate is None
+                    and type(data.get("total")) is int
+                    and data["total"] == 0
+                    and data.get("has_more", False) is False
+                ):
+                    items = []
                     break
             if items is None:
                 raise LarkCliBaseResponseError(

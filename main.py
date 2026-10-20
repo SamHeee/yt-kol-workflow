@@ -17,8 +17,9 @@ import os
 import argparse
 import json
 import logging
-from dataclasses import replace
-from datetime import datetime
+import hashlib
+from dataclasses import asdict, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Set
 from urllib.parse import urlsplit
@@ -36,8 +37,10 @@ from youtube.quota import (
     QuotaTracker,
     assert_budget_available,
     print_quota_estimate,
+    estimate_channel_detail_cost,
 )
 from feishu.bitable import BitableClient
+from feishu.value_utils import field_to_text
 from feishu.client_factory import (
     BaseTarget,
     FeishuClientContext,
@@ -382,16 +385,9 @@ def _estimate_remaining_cost(
     if channel_count <= 0:
         return cost
 
-    channel_batches = (channel_count + 49) // 50
-    cost += channel_batches * QUOTA_COSTS["channels.list"]
-
-    if use_playlist is False:
-        cost += channel_count * QUOTA_COSTS["search.list"]
-    else:
-        cost += channel_count * QUOTA_COSTS["playlistItems.list"]
-
-    recent_video_batches = (channel_count * 10 + 49) // 50
-    cost += recent_video_batches * QUOTA_COSTS["videos.list"]
+    cost += estimate_channel_detail_cost(
+        channel_count, use_playlist=use_playlist is not False,
+    )["total"]
     return cost
 
 
@@ -470,16 +466,30 @@ def _write_influencer_outputs(
         return
 
     for influencer in influencer_details:
-        influencer["influencer_record_date"] = ""
+        influencer.setdefault("influencer_record_date", "")
 
     if feishu_client and schema_mgr:
         if influencer_details:
             table_id = schema_mgr.get_table_id(INFLUENCERS_TABLE)
+            existing_fields = {
+                field_to_text((row.get("fields") or {}).get("Channel ID")): row.get("fields") or {}
+                for row in feishu_client.get_all_records(table_id)
+            }
             records = []
             ch_to_new = {c["channel_id"]: c for c in new_channels}
             for inf in influencer_details:
                 rep = ch_to_new.get(inf["channel_id"], {}).get("representative_video", {})
-                records.append(format_influencer_record(inf, rep, keyword))
+                record = format_influencer_record(inf, rep, keyword)
+                existing = existing_fields.get(inf["channel_id"])
+                if existing is not None:
+                    # Replaying a partially committed task must not reset
+                    # human-maintained names, contacts or outreach status.
+                    for name in ("KOL Name", "联系邮箱", "开发状态", "来源关键词"):
+                        if field_to_text(existing.get(name)):
+                            record["fields"].pop(name, None)
+                    if field_to_text(existing.get("联系邮箱")):
+                        record["fields"]["邮箱状态"] = "已获取"
+                records.append(record)
             result = feishu_client.upsert_records(
                 table_id,
                 records,
@@ -505,14 +515,78 @@ def _write_influencer_outputs(
                 fallback_key_fields=["Video ID"],
             )
             logger.info(f"飞书幂等写入网红视频表: 新增 {result['created']} 条, 更新 {result['updated']} 条")
-    elif influencer_details:
-        logger.warning("飞书未启用，网红记录日期将在本地 Excel 中留空")
 
     if excel_exporter:
         if influencer_details:
             excel_exporter.export_influencers(influencer_details)
         if influencer_videos:
             excel_exporter.export_influencer_videos(influencer_videos)
+
+
+def _completed_remote_channel_ids(client, schema_mgr) -> Set[str]:
+    """Legacy rows with pending details must not suppress a later retry."""
+    records = client.get_all_records(schema_mgr.get_table_id(INFLUENCERS_TABLE))
+    return {
+        field_to_text((row.get("fields") or {}).get("Channel ID"))
+        for row in records
+        if field_to_text((row.get("fields") or {}).get("断更评估"))
+        in {"持续更新", "有断更风险"}
+    } - {""}
+
+
+def _output_targets(client, schema_mgr, exporter):
+    targets = []
+    if client and schema_mgr:
+        token = str(getattr(client, "app_token", ""))
+        tables = getattr(schema_mgr, "table_ids", {})
+        identity = json.dumps([token, tables], sort_keys=True, ensure_ascii=False)
+        targets.append(("feishu:" + hashlib.sha256(identity.encode()).hexdigest()[:16], "feishu"))
+    if exporter:
+        targets.append(("excel:" + str(Path(exporter.get_output_dir()).resolve()), "excel"))
+    return targets
+
+
+def _flush_search_videos(state, client, schema_mgr, exporter, videos, keyword):
+    """Replay only output destinations that have not acknowledged this payload."""
+    for target, kind in _output_targets(client, schema_mgr, exporter):
+        if state.output_complete("b", target):
+            continue
+        if kind == "feishu":
+            table_id = schema_mgr.get_table_id(SEARCH_VIDEOS_TABLE)
+            records = [format_search_video_record(video, keyword) for video in videos]
+            if records:
+                client.upsert_records(
+                    table_id, records, fallback_key_fields=["搜索关键词", "Video ID"],
+                )
+                _populate_created_times(
+                    client, table_id, videos,
+                    source_key=lambda item: f"{keyword}|{item.get('video_id', '')}",
+                    feishu_key_field="唯一键", created_time_field="视频记录日期",
+                    output_key="video_record_date",
+                )
+        else:
+            exporter.export_search_videos(videos, keyword)
+        state.data["all_videos"] = videos
+        state.mark_output("b", target)
+
+
+def _flush_influencers(state, client, schema_mgr, exporter, details, videos, new_channels, keyword):
+    completed = state.completed_channel_ids()
+    for target, kind in _output_targets(client, schema_mgr, exporter):
+        if state.output_complete("d", target):
+            continue
+        _write_influencer_outputs(
+            client if kind == "feishu" else None, schema_mgr,
+            exporter if kind == "excel" else None,
+            [item for item in details if item.get("channel_id") in completed]
+            if kind == "feishu" else details,
+            [item for item in videos if item.get("channel_id") in completed]
+            if kind == "feishu" else videos,
+            new_channels, keyword,
+        )
+        state.data["influencer_details"] = details
+        state.data["influencer_videos"] = videos
+        state.mark_output("d", target)
 
 
 # ============================================================================
@@ -542,6 +616,28 @@ def run_single_keyword(
 
     if not state:
         state = WorkflowState(keyword, os.path.join(config.output_dir, "temp"))
+    option_names = (
+        "region", "lang", "max_results", "min_views", "min_engagement",
+        "filter_mode", "min_subscribers", "search_filters",
+    )
+    saved_options = state.data.get("run_options")
+    if saved_options:
+        config = replace(config, **{name: saved_options[name] for name in option_names})
+        config.brand_exclusion = BrandExclusion(**saved_options["brand_exclusion"])
+        if use_playlist is None:
+            use_playlist = saved_options.get("use_playlist")
+    else:
+        # Older checkpoints retained only part of the original configuration.
+        for name in option_names:
+            if name in state.data:
+                setattr(config, name, state.data[name])
+        state.data["run_options"] = {
+            **{name: getattr(config, name) for name in option_names},
+            "brand_exclusion": asdict(config.brand_exclusion),
+            "use_playlist": use_playlist,
+        }
+    if excel_exporter:
+        state.data["excel_output_dir"] = str(Path(excel_exporter.get_output_dir()).resolve())
 
     existing_channel_ids = set(existing_channel_ids or set())
     seen_store = SeenChannelStore(config.seen_channels_file)
@@ -549,6 +645,7 @@ def run_single_keyword(
     if seen_channel_ids:
         existing_channel_ids.update(seen_channel_ids)
         logger.info(f"本地持久频道库已有频道: {len(seen_channel_ids)} 个")
+    existing_channel_ids.difference_update(seen_store.pending_ids())
 
     summary = {
         "keyword": keyword,
@@ -564,7 +661,8 @@ def run_single_keyword(
         "error": "",
     }
 
-    start_time = datetime.now()
+    start_time = datetime.now(timezone.utc)
+    state.data.setdefault("search_time", start_time.isoformat())
     search_results = []
     qualified = []
     all_videos = []
@@ -586,7 +684,7 @@ def run_single_keyword(
             "keyword": keyword,
             "sort_order": sort_order,
             "region": config.region,
-            "search_time": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "search_time": state.data["search_time"],
             "result_count": summary["search_results"],
             "qualified_count": summary["qualified_count"],
             "unique_channels": summary["unique_channels"],
@@ -595,33 +693,51 @@ def run_single_keyword(
             "status": summary["status"],
             "note": summary.get("error", ""),
         }
+        output_errors = []
+
+        def output_failed(message, exc):
+            logger.warning("%s: %s", message, exc)
+            output_errors.append(f"{message}: {exc}")
+            if summary["status"] in {"进行中", "成功"}:
+                summary["status"] = "部分成功"
+            summary["error"] = "; ".join(filter(None, [summary["error"], output_errors[-1]]))
+            task_data["status"] = summary["status"]
+            task_data["note"] = summary["error"]
+
+        if excel_exporter:
+            try:
+                # A keyword run always has the same four-table local contract.
+                # Finish this before writing the final audit status.
+                excel_exporter.ensure_all_files()
+            except Exception as exc:
+                output_failed("补齐 Excel 失败", exc)
+            try:
+                excel_exporter.export_search_tasks([task_data])
+            except Exception as exc:
+                output_failed("搜索任务导出失败", exc)
 
         if feishu_client and schema_mgr:
             try:
                 table_id = schema_mgr.get_table_id(SEARCH_TASKS_TABLE)
                 feishu_client.upsert_records(
-                    table_id,
-                    [format_search_task_record(task_data)],
+                    table_id, [format_search_task_record(task_data)],
                     fallback_key_fields=["搜索关键词"],
                 )
             except Exception as exc:
-                logger.warning(f"写入飞书搜索任务表失败，本地搜索任务仍将保留: {exc}")
-
-        if excel_exporter:
-            try:
-                excel_exporter.export_search_tasks([task_data])
-            except Exception as exc:
-                logger.warning(f"导出本地搜索任务表失败: {exc}")
-            try:
-                # A keyword run always has the same four-table local contract.
-                # Empty result groups still get a header-only workbook, while
-                # files already written by earlier phases are left untouched.
-                excel_exporter.ensure_all_files()
-            except Exception as exc:
-                logger.warning(f"补齐四张本地 Excel 文件失败: {exc}")
+                output_failed("搜索任务写入失败", exc)
+                if excel_exporter:
+                    try:
+                        excel_exporter.export_search_tasks([task_data])
+                    except Exception as local_exc:
+                        output_failed("搜索任务失败状态导出失败", local_exc)
+        state.update_stats(task_output=task_data, task_output_errors=output_errors)
+        summary["state_file"] = str(state.state_file)
 
         if collect_results:
             summary["_search_tasks"] = [task_data]
+            summary["_search_videos"] = all_videos
+            summary["_influencers"] = influencer_details
+            summary["_influencer_videos"] = influencer_videos
         return summary
 
     if sort_order:
@@ -694,11 +810,13 @@ def run_single_keyword(
                 quota_tracker=quota_tracker,
             )
             if error:
+                state.update_stats(partial_search_videos=all_videos, last_error=error)
                 if _is_quota_exceeded(error):
                     _mark_quota_interrupted(summary, state, error)
-                    return _finalize_search_task_output()
-                summary["status"] = "部分成功"
-                summary["error"] = error
+                else:
+                    summary["status"] = "部分成功"
+                    summary["error"] = error
+                return _finalize_search_task_output()
 
             summary["qualified_count"] = len(qualified)
             state.update_stats(
@@ -707,36 +825,8 @@ def run_single_keyword(
                 all_videos=all_videos,
                 missing_video_ids=missing_ids,
             )
+            state.invalidate_outputs("b")
             state.mark_phase("b")
-
-            # Write to Feishu: search videos
-            for video in all_videos:
-                video["video_record_date"] = ""
-            if feishu_client and schema_mgr:
-                table_id = schema_mgr.get_table_id(SEARCH_VIDEOS_TABLE)
-                records = [format_search_video_record(v, keyword) for v in all_videos]
-                if records:
-                    result = feishu_client.upsert_records(
-                        table_id,
-                        records,
-                        fallback_key_fields=["搜索关键词", "Video ID"],
-                    )
-                    logger.info(f"飞书幂等写入视频数据表: 新增 {result['created']} 条, 更新 {result['updated']} 条")
-                    _populate_created_times(
-                        feishu_client,
-                        table_id,
-                        all_videos,
-                        source_key=lambda item: f"{keyword}|{item.get('video_id', '')}",
-                        feishu_key_field="唯一键",
-                        created_time_field="视频记录日期",
-                        output_key="video_record_date",
-                    )
-            elif all_videos:
-                logger.warning("飞书未启用，视频记录日期将在本地 Excel 中留空")
-
-            # Export Excel
-            if excel_exporter:
-                excel_exporter.export_search_videos(all_videos, keyword)
         else:
             if state.is_phase_complete("b"):
                 logger.info("阶段B已完成，跳过")
@@ -747,18 +837,18 @@ def run_single_keyword(
                 qualified = []
                 all_videos = []
 
+        _flush_search_videos(
+            state, feishu_client, schema_mgr, excel_exporter, all_videos, keyword,
+        )
+
         # ====== Phase C: Channel dedup ======
         if not state.is_phase_complete("c") and qualified:
             # Get existing channel IDs from Feishu for incremental check
-            if feishu_client and schema_mgr and not existing_channel_ids:
-                try:
-                    table_id = schema_mgr.get_table_id(INFLUENCERS_TABLE)
-                    existing_channel_ids = feishu_client.get_existing_values(
-                        table_id, "Channel ID"
-                    )
-                    logger.info(f"飞书已有网红: {len(existing_channel_ids)} 个")
-                except Exception as e:
-                    logger.warning(f"读取已有网红失败: {e}")
+            if feishu_client and schema_mgr:
+                existing_channel_ids.update(_completed_remote_channel_ids(feishu_client, schema_mgr))
+                existing_channel_ids.difference_update(seen_store.pending_ids())
+                logger.info(f"飞书及本地已完成网红: {len(existing_channel_ids)} 个")
+            existing_channel_ids.difference_update(state.data.get("replay_channel_ids", []))
 
             new_channels, existing_channels = run_phase_c(
                 qualified_videos=qualified,
@@ -774,6 +864,7 @@ def run_single_keyword(
                 new_channels=new_channels,
                 existing_channels=existing_channels,
                 phase_d_progress={"total_channels": len(new_channels), "completed_channels": 0, "completed_channel_ids": []},
+                channel_results={},
             )
             state.mark_phase("c")
         else:
@@ -790,13 +881,20 @@ def run_single_keyword(
                 new_channels = []
                 summary["_new_channel_ids"] = []
 
+        # A partially written remote influencer row is not proof that its
+        # recent videos or local exports committed. Persist that distinction.
+        if new_channels:
+            seen_store.mark_pending(new_channels)
+
         # ====== Phase D: Influencer details ======
         if not no_detail and new_channels:
             if not state.is_phase_complete("d"):
                 # Ask for video fetch method if not decided
                 if use_playlist is None:
                     use_playlist = ask_video_fetch_method(len(new_channels), quota_tracker)
+                state.data["run_options"]["use_playlist"] = use_playlist
 
+                state.invalidate_outputs("d")
                 influencer_details, influencer_videos, error = run_phase_d(
                     api_key=config.youtube.api_key,
                     new_channels=new_channels,
@@ -808,69 +906,50 @@ def run_single_keyword(
 
                 summary["influencers_fetched"] = len(influencer_details)
                 summary["influencer_videos"] = len(influencer_videos)
-
-                if error:
-                    _write_influencer_outputs(
-                        feishu_client=feishu_client,
-                        schema_mgr=schema_mgr,
-                        excel_exporter=excel_exporter,
-                        influencer_details=influencer_details,
-                        influencer_videos=influencer_videos,
-                        new_channels=new_channels,
-                        keyword=keyword,
-                    )
-                    state.update_stats(
-                        partial_influencer_details=influencer_details,
-                        partial_influencer_videos=influencer_videos,
-                    )
-                    if _is_quota_exceeded(error):
-                        if collect_results:
-                            summary["_search_videos"] = all_videos
-                            summary["_influencers"] = influencer_details
-                            summary["_influencer_videos"] = influencer_videos
-                        _mark_quota_interrupted(summary, state, error)
-                        return _finalize_search_task_output()
+                state.update_stats(
+                    influencer_details=influencer_details,
+                    influencer_videos=influencer_videos,
+                    last_error=error,
+                )
+                if not error:
+                    state.mark_phase("d")
+                elif _is_quota_exceeded(error):
+                    _mark_quota_interrupted(summary, state, error)
+                else:
                     summary["status"] = "部分成功"
                     summary["error"] = error
-                else:
-                    state.update_stats(
-                        influencer_details=influencer_details,
-                        influencer_videos=influencer_videos,
-                    )
-                    state.mark_phase("d")
-
-                    _write_influencer_outputs(
-                        feishu_client=feishu_client,
-                        schema_mgr=schema_mgr,
-                        excel_exporter=excel_exporter,
-                        influencer_details=influencer_details,
-                        influencer_videos=influencer_videos,
-                        new_channels=new_channels,
-                        keyword=keyword,
-                    )
             else:
                 logger.info("阶段D已完成，跳过")
                 influencer_details = state.data.get("influencer_details", [])
                 influencer_videos = state.data.get("influencer_videos", [])
                 summary["influencers_fetched"] = len(influencer_details)
                 summary["influencer_videos"] = len(influencer_videos)
+
+            _flush_influencers(
+                state, feishu_client, schema_mgr, excel_exporter,
+                influencer_details, influencer_videos, new_channels, keyword,
+            )
+            completed_ids = state.completed_channel_ids()
+            completed_details = [
+                detail for detail in influencer_details if detail.get("channel_id") in completed_ids
+            ]
+            # Only commit dedup state after every enabled destination persisted.
+            if completed_details and _output_targets(feishu_client, schema_mgr, excel_exporter):
+                seen_store.mark_channels(completed_details, source_keyword=keyword)
+                summary["_completed_channel_ids"] = sorted(completed_ids)
+            if summary["status"] == "配额中断":
+                return _finalize_search_task_output()
         else:
             influencer_details = []
             influencer_videos = []
             if no_detail:
                 logger.info("跳过阶段D (--no-detail)")
 
-        if new_channels and summary["status"] not in ("配额中断", "预算不足", "失败", "异常", "部分成功"):
-            seen_store.mark_channels(
-                influencer_details if influencer_details else new_channels,
-                source_keyword=keyword,
-            )
-
         # ====== Write search task record ======
         if summary["status"] == "进行中":
             summary["status"] = "成功"
 
-        elapsed = (datetime.now() - start_time).total_seconds()
+        elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
 
         if collect_results:
             summary["_search_videos"] = all_videos
@@ -966,9 +1045,9 @@ def run_batch(
                     write_excel = True
                 else:
                     print("任务已停止")
-                    return
+                    return {"status": "失败", "error": str(e), "results": [], "remaining_keywords": len(tasks)}
             elif not ask_confirm("飞书不可用，是否仅使用本地Excel继续?"):
-                return
+                return {"status": "失败", "error": str(e), "results": [], "remaining_keywords": len(tasks)}
 
     # Batch Excel exporter
     batch_exporter = BatchExcelExporter(config.output_dir) if write_excel else None
@@ -988,28 +1067,20 @@ def run_batch(
     except RuntimeError as exc:
         print(f"[FAIL] {exc}")
         print("请减少关键词数量、降低 --max-results，或等配额恢复后续跑。")
-        return
+        return {"status": "预算不足", "error": str(exc), "results": [], "remaining_keywords": len(tasks)}
 
     if not skip_confirm and not ask_confirm("确认执行批量任务?"):
         print("已取消")
-        return
+        return {"status": "中断", "error": "用户取消", "results": [], "remaining_keywords": len(tasks)}
 
     # Ask for playlist method once for all (only if not set via CLI)
     if use_playlist is None and not no_detail:
-        # Default to True (playlistItems) for efficiency, unless quota is very low
-        if quota_tracker.remaining() < quota_tracker.daily_limit * 0.1:
-            use_playlist = False  # Switch to search if quota < 10%
-        else:
-            use_playlist = True
+        use_playlist = True
 
     # Track all existing channel IDs across keywords
     existing_channel_ids: Set[str] = set()
     if feishu_client and schema_mgr:
-        try:
-            table_id = schema_mgr.get_table_id(INFLUENCERS_TABLE)
-            existing_channel_ids = feishu_client.get_existing_values(table_id, "Channel ID")
-        except Exception:
-            pass
+        existing_channel_ids = _completed_remote_channel_ids(feishu_client, schema_mgr)
 
     results = []
     for i, task in enumerate(tasks):
@@ -1069,21 +1140,14 @@ def run_batch(
             )
 
         results.append(summary)
-        existing_channel_ids.update(summary.pop("_new_channel_ids", []))
+        existing_channel_ids.update(summary.pop("_completed_channel_ids", []))
+        summary.pop("_new_channel_ids", None)
 
-        if summary.get("status") in ("配额中断", "预算不足"):
+        if summary.get("status") in ("配额中断", "预算不足", "中断"):
             print("\n批量任务已暂停。")
             if summary.get("state_file"):
                 print(f"可从该状态文件续跑当前关键词: {summary['state_file']}")
             break
-
-        # Update cross-keyword dedup set
-        if summary.get("new_channels", 0) > 0 and feishu_client and schema_mgr:
-            try:
-                table_id = schema_mgr.get_table_id(INFLUENCERS_TABLE)
-                existing_channel_ids = feishu_client.get_existing_values(table_id, "Channel ID")
-            except Exception:
-                pass
 
         # Check quota
         quota_tracker.warn_if_low(0.15)
@@ -1108,6 +1172,17 @@ def run_batch(
     if batch_exporter:
         print(f"\n本地文件: {batch_exporter.get_output_dir()}")
     print(f"{'='*60}")
+    incomplete = len(results) != len(tasks)
+    statuses = {item.get("status") for item in results}
+    if "中断" in statuses:
+        status = "中断"
+    elif incomplete or statuses & {"配额中断", "预算不足"}:
+        status = "配额中断"
+    elif statuses == {"成功"}:
+        status = "成功"
+    else:
+        status = "部分成功"
+    return {"status": status, "results": results, "remaining_keywords": len(tasks) - len(results)}
 
 
 # ============================================================================
@@ -1521,8 +1596,8 @@ def main():
         print("  channels.list:        1 unit/次 (最多50个ID)")
         print("  playlistItems.list:   1 unit/次")
         print("\n典型场景 (1关键词, 100结果, 15个新网红):")
-        print("  方案1 (playlistItems): ~221 units → 每日可处理 ~45 关键词")
-        print("  方案2 (search):       ~1706 units → 每日可处理 ~5 关键词")
+        print("  方案1 (playlistItems): ~233 units → 每日可处理 ~42 关键词")
+        print("  方案2 (search):       ~1718 units → 每日可处理 ~5 关键词")
         return
 
     if args.command == "feishu-setup":
@@ -1595,9 +1670,16 @@ def main():
     )
 
     if args.command == "search":
-        handle_search(args, config)
+        return _result_exit_code(handle_search(args, config))
     elif args.command == "batch":
-        handle_batch(args, config)
+        return _result_exit_code(handle_batch(args, config))
+
+
+def _result_exit_code(result):
+    """Expose incomplete work to schedulers instead of exiting successfully."""
+    return {
+        "成功": 0, "部分成功": 2, "配额中断": 3, "预算不足": 3, "中断": 130,
+    }.get((result or {}).get("status"), 1)
 
 
 def handle_search(args, config: WorkflowConfig):
@@ -1640,18 +1722,22 @@ def handle_search(args, config: WorkflowConfig):
                     args.no_excel = False
                 else:
                     print("任务已停止")
-                    return
+                    return {"status": "失败", "error": str(e)}
             elif not ask_confirm("飞书不可用，是否仅使用本地Excel继续?"):
-                return
+                return {"status": "失败", "error": str(e)}
 
     # Excel exporter
     excel_exporter = None
     if not args.no_excel:
-        excel_exporter = ExcelExporter(config.output_dir, keyword)
+        saved_directory = state.data.get("excel_output_dir") if state else None
+        excel_exporter = (
+            ExcelExporter.resume(saved_directory) if saved_directory
+            else ExcelExporter(config.output_dir, keyword)
+        )
 
     quota_tracker = QuotaTracker(config.youtube.daily_quota)
 
-    run_single_keyword(
+    result = run_single_keyword(
         keyword=keyword,
         config=config,
         sort_order=sort_order,
@@ -1667,6 +1753,7 @@ def handle_search(args, config: WorkflowConfig):
         print(f"本地文件: {excel_exporter.get_output_dir()}")
 
     print(f"\n{quota_tracker.summary()}")
+    return result
 
 
 def handle_batch(args, config: WorkflowConfig):
@@ -1681,7 +1768,7 @@ def handle_batch(args, config: WorkflowConfig):
         sr = t.sort_order or args.sort_order or "(待询问)"
         print(f"  {i+1}. {t.keyword} [排序={sr}, 数量={t.max_results or config.max_results}]")
 
-    run_batch(
+    return run_batch(
         tasks=tasks,
         config=config,
         default_sort_order=args.sort_order or "",
@@ -1988,7 +2075,7 @@ def handle_refresh_cooperation_content(args):
     from workflow.refresh_cooperation_content import refresh_cooperation_content
 
     feishu_cfg = _feishu_config_from_args(args)
-    if feishu_cfg.auth_mode != "cli":
+    if feishu_cfg.auth_mode not in {"auto", "cli"}:
         raise RuntimeError(
             "合作内容刷新仅允许 FEISHU_AUTH_MODE=cli；不会降级为 App 凭证模式"
         )
@@ -2139,7 +2226,7 @@ def handle_refresh_sample_logistics(args):
     from workflow.refresh_sample_logistics import refresh_sample_logistics
 
     feishu_cfg = _feishu_config_from_args(args)
-    if feishu_cfg.auth_mode != "cli":
+    if feishu_cfg.auth_mode not in {"auto", "cli"}:
         raise RuntimeError(
             "样品物流刷新仅允许 FEISHU_AUTH_MODE=cli；不会降级为 App 凭证模式"
         )
@@ -2228,7 +2315,7 @@ def handle_dispatch_sample_reminders(args):
     from workflow.sample_reminders import dispatch_sample_reminders
 
     feishu_cfg = _feishu_config_from_args(args)
-    if feishu_cfg.auth_mode != "cli":
+    if feishu_cfg.auth_mode not in {"auto", "cli"}:
         raise RuntimeError(
             "样品物流提醒仅允许 FEISHU_AUTH_MODE=cli；不会降级为 App 凭证模式"
         )
@@ -2341,4 +2428,4 @@ def handle_exclusion(args):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

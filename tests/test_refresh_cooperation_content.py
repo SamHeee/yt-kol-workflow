@@ -178,6 +178,24 @@ def test_duplicate_alias_urls_are_rejected_before_api(monkeypatch):
     assert "record_id=rec1" in updates_by_record["rec2"]["同步错误"]
 
 
+@pytest.mark.parametrize("invalid_status", ["已取消", "已下架", "unmatched"])
+def test_invalid_historical_row_cannot_own_duplicate_video(monkeypatch, invalid_status):
+    old = _record("rec-old", content_id="CNT-000001")
+    if invalid_status == "unmatched":
+        old["fields"]["合作自动编号"] = ""
+    else:
+        old["fields"]["内容状态"] = invalid_status
+    client = FakeClient([old, _record("rec-new", content_id="CNT-000002")])
+    monkeypatch.setattr(refresh_module, "fetch_video_details", lambda *a, **k: ([_video()], [], ""))
+    result = refresh_module.refresh_cooperation_content(
+        api_key="key", client=client, table_id="table", now=NOW, force=True
+    )
+    assert result["requested_video_ids"] == 1
+    updates = {item["record_id"]: item["fields"] for item in client.updates}
+    assert updates["rec-new"]["数据同步状态"] == "同步成功"
+    assert result["status_counts"]["重复视频"] == 0
+
+
 def test_duplicate_without_content_id_uses_stable_record_id_fallback(monkeypatch):
     records = [
         _record("rec_z", content_id=""),

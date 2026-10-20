@@ -8,6 +8,7 @@ from logistics.base import (
     TrackingSyncStatus,
 )
 from workflow import refresh_sample_logistics as refresh_module
+from feishu.sample_logistics import PROVIDER_DELIVERED_AT_FIELD, DELIVERED_DATE_REVIEW_FIELD, LAST_QUERY_SHIPMENT_KEY_FIELD
 
 
 NOW = datetime(2026, 8, 4, 1, 0, 0, tzinfo=timezone.utc)
@@ -548,6 +549,122 @@ def test_provider_failure_preserves_latest_successful_progress():
     assert "最新物流时间" not in fields
     assert "物流源同步时间" not in fields
     assert "super-secret" not in fields["物流查询错误"]
+
+
+def test_failed_query_uses_short_backoff_then_retries_instead_of_success_cache():
+    _assert_failure_retry(synced=True)
+
+
+def test_new_parcel_failure_also_uses_bounded_retry_without_fake_registration():
+    _assert_failure_retry(synced=False)
+
+
+def _assert_failure_retry(*, synced):
+    record = _record(synced=synced)
+    first_client = FakeClient([record])
+    refresh_module.refresh_sample_logistics(
+        provider=FakeProvider(error=RuntimeError("temporary failure")),
+        client=first_client, table_id="table", now=NOW,
+    )
+    record["fields"].update(first_client.updates[0]["fields"])
+    provider = FakeProvider([_result(event_time=NOW)])
+    blocked = refresh_module.refresh_sample_logistics(
+        provider=provider, client=FakeClient([record]), table_id="table",
+        now=NOW + timedelta(minutes=1),
+    )
+    assert blocked["skipped_counts"] == {"retry_backoff": 1}
+    assert provider.calls == []
+    retried = refresh_module.refresh_sample_logistics(
+        provider=provider, client=FakeClient([record]), table_id="table",
+        now=NOW + timedelta(hours=1),
+    )
+    assert retried["candidate_records"] == 1
+    assert len(provider.calls) == 1
+
+    record["fields"]["物流单号"] = "NEW-002"
+    changed = refresh_module.refresh_sample_logistics(
+        provider=provider, client=FakeClient([record]), table_id="table",
+        now=NOW + timedelta(minutes=1), dry_run=True,
+    )
+    assert changed["candidate_records"] == 1
+
+
+def test_changed_parcel_preserves_manual_date_but_uses_new_delivery_event():
+    old_delivery = NOW_MS - 10 * 86400 * 1000
+    new_delivery = NOW - timedelta(hours=1)
+    record = _record(tracking_number="NEW-001", delivered_at=old_delivery)
+    record["fields"]["已同步运单键"] = refresh_module._shipment_key("17track", "ups", "OLD-001")
+    record["fields"][PROVIDER_DELIVERED_AT_FIELD] = old_delivery
+    client = FakeClient([record])
+    refresh_module.refresh_sample_logistics(
+        provider=FakeProvider([_result(number="NEW-001", status=TrackingStatus.DELIVERED, event_time=new_delivery)]),
+        client=client, table_id="table", now=NOW,
+    )
+    update = client.updates[0]["fields"]
+    assert "签收日期" not in update
+    assert update[PROVIDER_DELIVERED_AT_FIELD] == int(new_delivery.timestamp() * 1000)
+    assert update[DELIVERED_DATE_REVIEW_FIELD] == "已有签收日期待人工确认"
+
+
+def test_legacy_signed_row_backfills_provider_date_without_clearing_history():
+    historical_date = NOW_MS - 8 * 86400 * 1000
+    record = _record(synced=True, sample_status="已签收", delivered_at=historical_date)
+    provider_time = NOW - timedelta(days=2)
+    client = FakeClient([record])
+    result = refresh_module.refresh_sample_logistics(
+        provider=FakeProvider([_result(status=TrackingStatus.DELIVERED, event_time=provider_time)]),
+        client=client, table_id="table", now=NOW,
+    )
+    assert result["actual_updates"] == 1
+    update = client.updates[0]["fields"]
+    assert "签收日期" not in update
+    assert update[PROVIDER_DELIVERED_AT_FIELD] == int(provider_time.timestamp() * 1000)
+    assert update[DELIVERED_DATE_REVIEW_FIELD] == "已有签收日期待人工确认"
+
+
+def test_manually_adjusted_auto_date_is_preserved_and_its_review_state_changes():
+    record = _record(synced=True, delivered_at=NOW_MS - 5 * 86400 * 1000)
+    record["fields"][PROVIDER_DELIVERED_AT_FIELD] = NOW_MS - 2 * 86400 * 1000
+    record["fields"][DELIVERED_DATE_REVIEW_FIELD] = "物流填写"
+    client = FakeClient([record])
+    refresh_module.refresh_sample_logistics(
+        provider=FakeProvider([_result(status=TrackingStatus.DELIVERED, event_time=NOW - timedelta(days=2))]),
+        client=client, table_id="table", now=NOW,
+    )
+    update = client.updates[0]["fields"]
+    assert "签收日期" not in update
+    assert update[DELIVERED_DATE_REVIEW_FIELD] == "签收日期已人工调整"
+
+
+def test_delivery_without_event_time_does_not_invent_or_reuse_delivery_date():
+    old_date = NOW_MS - 8 * 86400 * 1000
+    client = FakeClient([_record(delivered_at=old_date)])
+    refresh_module.refresh_sample_logistics(
+        provider=FakeProvider([_result(status=TrackingStatus.DELIVERED)]),
+        client=client, table_id="table", now=NOW,
+    )
+    update = client.updates[0]["fields"]
+    assert "签收日期" not in update
+    assert update[PROVIDER_DELIVERED_AT_FIELD] is None
+    assert update[DELIVERED_DATE_REVIEW_FIELD] == "物流签收时间缺失待人工确认"
+
+
+def test_older_event_status_revision_keeps_existing_business_policy():
+    old_time = NOW - timedelta(hours=80)
+    client = FakeClient([_record(
+        synced=True, latest_status="派送中", latest_progress="Destination facility",
+        latest_event_at=int(old_time.timestamp() * 1000),
+        stagnation_started_at=int(old_time.timestamp() * 1000),
+    )])
+    refresh_module.refresh_sample_logistics(
+        provider=FakeProvider([_result(status=TrackingStatus.IN_TRANSIT, event_time=old_time - timedelta(hours=12))]),
+        client=client, table_id="table", now=NOW, force=True,
+    )
+    update = client.updates[0]["fields"]
+    assert update["物流状态"] == "运输中"
+    assert update["物流停滞起算时间"] == NOW_MS
+    assert "最新物流时间" not in update
+    assert "最新物流进度" not in update
 
 
 def test_result_samples_expose_field_names_but_not_logistics_values():

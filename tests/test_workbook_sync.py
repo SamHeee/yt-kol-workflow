@@ -163,3 +163,31 @@ def test_primary_and_created_time_columns_are_read_only():
     )
 
     assert fields == {"唯一键": "keyword|video-1", "Video ID": "video-1"}
+
+
+@pytest.mark.parametrize(
+    ("existing", "incoming", "expected_email", "expected_status"),
+    [
+        ({"联系邮箱": "", "邮箱状态": "需手动查找"}, {"联系邮箱": "new@example.com", "邮箱状态": "已获取"}, "new@example.com", "已获取"),
+        ({"联系邮箱": "human@example.com", "邮箱状态": "需手动查找"}, {"联系邮箱": "auto@example.com", "邮箱状态": "需手动查找"}, "human@example.com", "已获取"),
+        ({"联系邮箱": "", "邮箱状态": "已获取"}, {"联系邮箱": "", "邮箱状态": "已获取"}, "", "需手动查找"),
+    ],
+)
+def test_email_status_matches_final_adopted_email(existing, incoming, expected_email, expected_status):
+    config = workbook_sync.TABLE_CONFIGS["influencers"]
+    meta = {name: {"type": 1} for name in config["field_map"].values()}
+    fields = workbook_sync.build_fields(incoming, config, meta, existing)
+    final = dict(existing, **fields)
+    assert final["联系邮箱"] == expected_email
+    assert final["邮箱状态"] == expected_status
+
+
+def test_email_status_verification_uses_preserved_manual_email(monkeypatch):
+    config = workbook_sync.TABLE_CONFIGS["influencers"]
+    meta = {name: {"type": 1} for name in config["field_map"].values()}
+    monkeypatch.setattr(workbook_sync, "list_field_meta", lambda *args: meta)
+    monkeypatch.setattr(workbook_sync, "load_table_source_rows", lambda *args, **kwargs: [{"Channel ID": "UC1", "邮箱状态": "需手动查找"}])
+    client = FakeClient()
+    client.records = [{"record_id": "rec1", "fields": {"Channel ID": "UC1", "联系邮箱": "human@example.com", "邮箱状态": "已获取"}}]
+    result = workbook_sync.verify_table(client, None, "influencers", "tbl1")
+    assert result["passed"] is True

@@ -57,6 +57,9 @@ ADDED_FIELDS = (
     "提醒事件键",
     "提醒发送时间",
     "提醒错误",
+    "物流签收时间",
+    "签收日期核验状态",
+    "上次查询运单键",
 )
 
 
@@ -75,6 +78,7 @@ def _field_metadata():
         "物流源同步时间": "yyyy-MM-dd HH:mm",
         "上次查询时间": "yyyy-MM-dd HH:mm",
         "提醒发送时间": "yyyy-MM-dd HH:mm",
+        "物流签收时间": "yyyy-MM-dd HH:mm",
     }
     fields = []
     for index, (name, field_type) in enumerate(SAMPLE_LOGISTICS_FIELDS):
@@ -111,7 +115,7 @@ def _field_metadata():
 def test_contract_inserts_cost_columns_after_sample_detail():
     names = tuple(field_names())
 
-    assert len(SAMPLE_LOGISTICS_FIELDS) == 30
+    assert len(SAMPLE_LOGISTICS_FIELDS) == 33
     assert names == (
         ORIGINAL_FIELDS[:7]
         + ("样品成本", "样品运费")

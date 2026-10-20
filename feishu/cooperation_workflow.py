@@ -393,8 +393,35 @@ def _strip_server_option_ids(value: Any) -> Any:
     return result
 
 
+def _strip_verified_ref_table_info(
+    value: Any, reference_tables: Mapping[str, str],
+) -> Any:
+    """Remove only a redundant, verified source-table annotation on field refs.
+
+    Workflow-get adds ``extra_info: {table_name: ...}`` to the two trigger
+    field references. Their source is already determined by the exact
+    step/field path. Unknown annotations, conflicting tables and annotations
+    on other value types remain visible to the strict semantic diff.
+    """
+    if isinstance(value, list):
+        return [_strip_verified_ref_table_info(item, reference_tables) for item in value]
+    if not isinstance(value, Mapping):
+        return copy.deepcopy(value)
+    result = {
+        key: _strip_verified_ref_table_info(item, reference_tables)
+        for key, item in value.items()
+    }
+    reference = result.get("value")
+    if result.get("value_type") == "ref" and isinstance(reference, str):
+        source_table = reference_tables.get(reference)
+        if source_table is not None and result.get("extra_info") == {"table_name": source_table}:
+            result.pop("extra_info")
+    return result
+
+
 def _canonical_workflow(
     body: Mapping[str, Any],
+    reference_tables: Mapping[str, str],
 ) -> Tuple[Dict[str, Any], List[str]]:
     errors: List[str] = []
     raw_steps = body.get("steps")
@@ -429,7 +456,10 @@ def _canonical_workflow(
         errors.append(f"存在合同外步骤: {sorted(extra)}")
 
     ordered_steps = [
-        _strip_server_option_ids(_canonical_step(by_id[step_id]))
+        _strip_verified_ref_table_info(
+            _strip_server_option_ids(_canonical_step(by_id[step_id])),
+            reference_tables,
+        )
         for step_id in STEP_IDS
         if step_id in by_id
     ]
@@ -484,8 +514,9 @@ def first_cooperation_workflow_errors(
     """Return semantic drift from the portable five-step workflow contract.
 
     Workflow-get envelopes, server-added ``status`` fields, missing/null
-    terminal ``next`` values, and empty ``children.links`` on action steps are
-    normalized away.  Step order and branch-link order are also non-semantic;
+    terminal ``next`` values, empty ``children.links`` on action steps, and
+    verified source-table annotations on the two trigger field refs are
+    normalized away. Step order and branch-link order are also non-semantic;
     topology, conditions, references, action fields and option IDs are strict.
     """
 
@@ -500,11 +531,15 @@ def first_cooperation_workflow_errors(
         enter_cooperation_option=enter_cooperation_option,
         initial_cooperation_status_option=initial_cooperation_status_option,
     )
-    expected_canonical, expected_errors = _canonical_workflow(expected)
+    reference_tables = {
+        _field_ref(TRIGGER_STEP_ID, influencer_contact_email_field_id): INFLUENCER_TABLE,
+        _field_ref(TRIGGER_STEP_ID, influencer_channel_id_field_id): INFLUENCER_TABLE,
+    }
+    expected_canonical, expected_errors = _canonical_workflow(expected, reference_tables)
     if expected_errors:  # Defensive: the module's own template must be valid.
         raise AssertionError("内置 Workflow 模板无效: " + "；".join(expected_errors))
 
-    actual_canonical, structural_errors = _canonical_workflow(body)
+    actual_canonical, structural_errors = _canonical_workflow(body, reference_tables)
     return structural_errors + _semantic_diff(
         expected_canonical,
         actual_canonical,

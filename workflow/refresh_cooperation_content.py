@@ -114,7 +114,13 @@ def refresh_cooperation_content(
         video_id = extract_video_id(field_to_text(fields.get(VIDEO_URL_FIELD)))
         if record_id:
             parsed_ids_by_record[record_id] = video_id
-        if record_id and video_id:
+        # Terminal or unmatched rows cannot own a video: they will never be
+        # refreshed below, so letting them win would strand valid rows.
+        if (
+            record_id and video_id
+            and field_to_text(fields.get(CONTENT_STATUS_FIELD)) not in TERMINAL_CONTENT_STATUSES
+            and not _cooperation_match_error(fields)
+        ):
             records_by_video_id[video_id].append((content_id, record_id))
     duplicate_primary_by_record: Dict[str, str] = {}
     for occurrences in records_by_video_id.values():

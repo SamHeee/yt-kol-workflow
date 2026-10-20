@@ -17,6 +17,7 @@ from filter.email_extractor import extract_email
 from filter.kol_name_extractor import extract_kol_name
 from youtube.channels import fetch_channel_details
 from youtube.playlists import get_channel_uploads
+from youtube.quota import estimate_channel_detail_cost
 from youtube.videos import extract_video_id, fetch_video_details
 
 
@@ -57,6 +58,9 @@ def refresh_influencers(
             "estimated_quota": 0,
             "planned_updates": 0,
             "actual_updates": 0,
+            "concurrent_skips": 0,
+            "missing_before_write": 0,
+            "protected_names": 0,
             "dry_run": dry_run,
             "replace_kol_names": replace_kol_names,
             "status_counts": {"持续更新": 0, "有断更风险": 0, "待确认": 0},
@@ -73,7 +77,7 @@ def refresh_influencers(
         if limit is not None and len(records) >= limit:
             break
 
-    estimated_quota = _estimate_quota(records, selected)
+    estimated_quota = _estimate_quota(records, selected, recent_video_count=recent_video_count)
     if quota_tracker is not None and estimated_quota > quota_tracker.remaining():
         raise RuntimeError(
             f"刷新预计需要约 {estimated_quota} units，当前进程预算仅剩 "
@@ -192,8 +196,49 @@ def refresh_influencers(
                 samples.append({"channel_id": channel_id, "fields": update_fields})
 
     actual_updates = 0
+    concurrent_skips = 0
+    missing_before_write = 0
+    protected_names = 0
     if updates and not dry_run:
-        actual_updates = client.batch_update_records(table_id, updates)
+        originals = {
+            record["record_id"]: record.get("fields") or {}
+            for record in records if record.get("record_id")
+        }
+        for offset in range(0, len(updates), 100):
+            batch = updates[offset:offset + 100]
+            # Re-read immediately before each write batch. A long YouTube fetch
+            # must not overwrite a name or source that a person changed meanwhile.
+            latest_records = client.batch_get_records(
+                table_id, [update["record_id"] for update in batch]
+            )
+            latest_by_id = {
+                record["record_id"]: record.get("fields") or {}
+                for record in latest_records if record.get("record_id")
+            }
+            safe_updates = []
+            for update in batch:
+                record_id = update["record_id"]
+                latest = latest_by_id.get(record_id)
+                if latest is None:
+                    missing_before_write += 1
+                    continue
+                original = originals[record_id]
+                if _source_signature(latest) != _source_signature(original):
+                    concurrent_skips += 1
+                    continue
+                safe_fields = dict(update["fields"])
+                latest_name = field_to_text(latest.get("KOL Name"))
+                original_name = field_to_text(original.get("KOL Name"))
+                if "KOL Name" in safe_fields and (
+                    latest_name != original_name
+                    or (latest_name and latest_name != "手动确认" and not replace_kol_names)
+                ):
+                    safe_fields.pop("KOL Name")
+                    protected_names += 1
+                if safe_fields:
+                    safe_updates.append({"record_id": record_id, "fields": safe_fields})
+            if safe_updates:
+                actual_updates += client.batch_update_records(table_id, safe_updates)
 
     return {
         "selected_fields": sorted(selected),
@@ -201,6 +246,9 @@ def refresh_influencers(
         "estimated_quota": estimated_quota,
         "planned_updates": len(updates),
         "actual_updates": actual_updates,
+        "concurrent_skips": concurrent_skips,
+        "missing_before_write": missing_before_write,
+        "protected_names": protected_names,
         "dry_run": dry_run,
         "replace_kol_names": replace_kol_names,
         "status_counts": status_counts,
@@ -218,7 +266,17 @@ def _selected_fields(choice: str) -> Set[str]:
     return {choice}
 
 
-def _estimate_quota(records: Sequence[Dict[str, Any]], selected: Set[str]) -> int:
+def _source_signature(fields: Dict[str, Any]) -> tuple:
+    return tuple(field_to_text(fields.get(name)) for name in (
+        "Channel ID", "Channel Name", "频道描述", "联系邮箱", "来源关键词", "代表视频URL",
+    ))
+
+
+def _estimate_quota(
+    records: Sequence[Dict[str, Any]],
+    selected: Set[str],
+    recent_video_count: int = 10,
+) -> int:
     count = len(records)
     if not count:
         return 0
@@ -226,7 +284,8 @@ def _estimate_quota(records: Sequence[Dict[str, Any]], selected: Set[str]) -> in
     if selected & {"name", "assessment"}:
         cost += math.ceil(count / 50)  # channels.list
     if selected & {"activity", "assessment"}:
-        cost += count * 2  # playlistItems.list + videos.list per channel
+        detail = estimate_channel_detail_cost(count, recent_video_count=recent_video_count)
+        cost += detail["recent_videos"] + detail["recent_video_detail"]
     if "rep-title" in selected:
         representative_ids = {
             extract_video_id(field_to_text((record.get("fields") or {}).get("代表视频URL")))

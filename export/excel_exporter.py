@@ -397,6 +397,16 @@ class ExcelExporter:
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.files_created: List[str] = []
 
+    @classmethod
+    def resume(cls, directory: str):
+        """Reopen the original task directory without creating a new run."""
+        exporter = cls.__new__(cls)
+        exporter.base_dir = Path(directory)
+        exporter.base_dir.mkdir(parents=True, exist_ok=True)
+        exporter.timestamp = ""
+        exporter.files_created = []
+        return exporter
+
     def export_search_tasks(self, tasks: List[Dict]) -> str:
         """Export search-task audit records."""
         fp = str(self.base_dir / "search_tasks.xlsx")

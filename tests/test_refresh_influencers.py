@@ -1,3 +1,7 @@
+from copy import deepcopy
+
+import pytest
+
 from workflow import refresh_influencers as refresh_module
 
 
@@ -7,7 +11,10 @@ class FakeClient:
         self.updates = []
 
     def get_all_records(self, table_id):
-        return self.records
+        return deepcopy(self.records)
+
+    def batch_get_records(self, table_id, record_ids):
+        return deepcopy([record for record in self.records if record["record_id"] in record_ids])
 
     def batch_update_records(self, table_id, updates):
         self.updates.extend(updates)
@@ -135,3 +142,90 @@ def test_quota_estimate_uses_batched_channel_and_representative_calls():
     # 2 channels.list batches + 102 per-channel recent-video units +
     # 1 batched representative-title videos.list call (same URL in fixtures).
     assert refresh_module._estimate_quota(records, refresh_module.ALL_REFRESH_FIELDS) == 105
+
+
+def _mock_name_source(monkeypatch):
+    monkeypatch.setattr(
+        refresh_module, "fetch_channel_details",
+        lambda *args, **kwargs: ([{"channel_id": "UC1", "channel_title": "Sarah Jones", "channel_description": "I'm Sarah."}], ""),
+    )
+
+
+def test_refresh_preserves_name_edited_during_youtube_fetch(monkeypatch):
+    class ConcurrentClient(FakeClient):
+        def batch_get_records(self, table_id, record_ids):
+            latest = super().batch_get_records(table_id, record_ids)
+            latest[0]["fields"]["KOL Name"] = "Human confirmed Sarah"
+            return latest
+
+    client = ConcurrentClient([_record("rec1", "UC1", "手动确认")])
+    _mock_name_source(monkeypatch)
+    result = refresh_module.refresh_influencers(api_key="key", client=client, table_id="table", fields="name")
+    assert result["actual_updates"] == 0
+    assert result["protected_names"] == 1
+    assert client.updates == []
+
+
+@pytest.mark.parametrize("latest_name", ["Human confirmed Sarah", ""])
+def test_migration_flag_does_not_replace_concurrently_changed_name(monkeypatch, latest_name):
+    class ConcurrentClient(FakeClient):
+        def batch_get_records(self, table_id, record_ids):
+            latest = super().batch_get_records(table_id, record_ids)
+            latest[0]["fields"]["KOL Name"] = latest_name
+            return latest
+
+    client = ConcurrentClient([_record("rec1", "UC1", "Old automatic guess")])
+    _mock_name_source(monkeypatch)
+    result = refresh_module.refresh_influencers(
+        api_key="key", client=client, table_id="table", fields="name", replace_kol_names=True,
+    )
+    assert result["actual_updates"] == 0
+    assert result["protected_names"] == 1
+
+
+@pytest.mark.parametrize("source_field", ["Channel ID", "代表视频URL", "频道描述", "联系邮箱"])
+def test_refresh_skips_record_whose_source_changed_before_write(monkeypatch, source_field):
+    class ConcurrentClient(FakeClient):
+        def batch_get_records(self, table_id, record_ids):
+            latest = super().batch_get_records(table_id, record_ids)
+            latest[0]["fields"][source_field] = "changed by a person"
+            return latest
+
+    client = ConcurrentClient([_record("rec1", "UC1", "手动确认")])
+    _mock_name_source(monkeypatch)
+    result = refresh_module.refresh_influencers(api_key="key", client=client, table_id="table", fields="name")
+    assert result["actual_updates"] == 0
+    assert result["concurrent_skips"] == 1
+
+
+def test_refresh_does_not_write_when_fresh_record_read_fails(monkeypatch):
+    client = FakeClient([_record("rec1", "UC1", "手动确认")])
+    _mock_name_source(monkeypatch)
+    monkeypatch.setattr(client, "batch_get_records", lambda *args: (_ for _ in ()).throw(RuntimeError("read failed")))
+    with pytest.raises(RuntimeError, match="read failed"):
+        refresh_module.refresh_influencers(api_key="key", client=client, table_id="table", fields="name")
+    assert client.updates == []
+
+
+def test_refresh_skips_record_deleted_before_write(monkeypatch):
+    client = FakeClient([_record("rec1", "UC1", "手动确认")])
+    _mock_name_source(monkeypatch)
+    monkeypatch.setattr(client, "batch_get_records", lambda *args: [])
+    result = refresh_module.refresh_influencers(api_key="key", client=client, table_id="table", fields="name")
+    assert result["actual_updates"] == 0
+    assert result["missing_before_write"] == 1
+
+
+def test_refresh_does_not_write_old_title_after_representative_url_changes(monkeypatch):
+    class ConcurrentClient(FakeClient):
+        def batch_get_records(self, table_id, record_ids):
+            latest = super().batch_get_records(table_id, record_ids)
+            latest[0]["fields"]["代表视频URL"] = "https://youtu.be/bcdefghijkl"
+            return latest
+
+    client = ConcurrentClient([_record("rec1", "UC1", "Sarah")])
+    monkeypatch.setattr(refresh_module, "fetch_video_details", lambda *args, **kwargs: ([{"video_id": "abcdefghijk", "title": "Old representative"}], [], ""))
+    result = refresh_module.refresh_influencers(api_key="key", client=client, table_id="table", fields="rep-title")
+    assert result["actual_updates"] == 0
+    assert result["concurrent_skips"] == 1
+    assert client.updates == []

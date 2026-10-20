@@ -378,12 +378,20 @@ def parse_keywords_file(filepath: str, default_max_results: int = 100) -> List[K
         with open(path, "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                keyword = row.get("keyword", "").strip()
+                row_number = reader.line_num
+                keyword = (row.get("keyword") or "").strip()
                 if not keyword:
                     continue
-                sort_order = row.get("sort_order", "").strip()
-                max_results_str = row.get("max_results", "").strip()
-                max_results = int(max_results_str) if max_results_str else default_max_results
+                sort_order = (row.get("sort_order") or "").strip()
+                if sort_order and sort_order not in {"relevance", "viewCount", "date", "rating", "title"}:
+                    raise ValueError(f"CSV 第 {row_number} 行 sort_order 无效: {sort_order}")
+                max_results_str = (row.get("max_results") or "").strip()
+                try:
+                    max_results = int(max_results_str) if max_results_str else default_max_results
+                except ValueError as exc:
+                    raise ValueError(f"CSV 第 {row_number} 行 max_results 必须为正整数: {max_results_str}") from exc
+                if max_results <= 0:
+                    raise ValueError(f"CSV 第 {row_number} 行 max_results 必须为正整数: {max_results}")
                 tasks.append(KeywordTask(
                     keyword=keyword,
                     sort_order=sort_order,

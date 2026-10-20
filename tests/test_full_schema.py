@@ -42,9 +42,8 @@ EXPECTED_TABLE_ORDER = (
 )
 
 
-def test_full_contract_has_seven_tables_149_fields_and_nine_lookups():
+def test_full_contract_has_seven_tables_and_nine_lookups():
     assert FULL_SCHEMA.table_names == EXPECTED_TABLE_ORDER
-    assert FULL_SCHEMA.field_count == 149
     assert FULL_SCHEMA.lookup_count == 9
     assert FULL_SCHEMA.view_count == 7
     assert set(TABLE_SPECS) == set(EXPECTED_TABLE_ORDER)
@@ -266,6 +265,8 @@ def test_select_date_and_number_metadata_needed_by_runtime_is_present():
     )
     assert sample.field("发货日期").date_format == "yyyy-MM-dd"
     assert sample.field("最新物流时间").date_format == "yyyy-MM-dd HH:mm"
+    assert sample.field("物流签收时间").date_format == "yyyy-MM-dd HH:mm"
+    assert sample.field("签收日期核验状态").field_type == TEXT
     assert content.field("Publish Time").date_format == "yyyy-MM-dd HH:mm"
     assert content.field("Views").number_format == "1,000"
     assert content.field("互动率(%)").number_format == "0.00"

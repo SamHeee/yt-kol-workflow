@@ -7,6 +7,7 @@ import main as workflow_main
 from config import FeishuConfig, LogisticsConfig, WorkflowConfig
 from feishu.client_factory import BaseTarget, load_base_target, save_base_target
 from feishu.cooperation_content import COOPERATION_CONTENT_FIELDS
+from feishu.full_schema import FULL_SCHEMA
 
 
 def test_maintenance_commands_allow_omitting_base_target(monkeypatch):
@@ -185,7 +186,7 @@ def test_full_setup_dry_run_without_target_is_offline_and_creates_nothing(
     output = capsys.readouterr().out
     assert "离线计划" in output
     assert "7 张工作表" in output
-    assert "149 个" in output
+    assert f"{FULL_SCHEMA.field_count} 个" in output
     assert "本次未创建" in output
 
 

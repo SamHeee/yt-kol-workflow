@@ -1,6 +1,6 @@
 import pytest
 
-from config import FeishuConfig, LogisticsConfig
+from config import FeishuConfig, LogisticsConfig, parse_keywords_file
 
 
 LOGISTICS_ENV_VARS = (
@@ -88,3 +88,40 @@ def test_feishu_url_is_preserved_for_cli_resolution():
     url = "https://example.feishu.cn/wiki/fake_test_base_token"
 
     assert FeishuConfig.extract_app_token(url) == url
+
+
+def test_keyword_csv_defaults_missing_trailing_optional_cells(tmp_path):
+    source = tmp_path / "keywords.csv"
+    source.write_text("keyword,sort_order,max_results\ncamping\ngear,date\n", encoding="utf-8")
+    tasks = parse_keywords_file(str(source), default_max_results=75)
+    assert [(task.keyword, task.sort_order, task.max_results) for task in tasks] == [
+        ("camping", "", 75), ("gear", "date", 75),
+    ]
+
+
+@pytest.mark.parametrize("value", ["oops", "0", "-3", "1.5"])
+def test_keyword_csv_reports_row_for_invalid_max_results(tmp_path, value):
+    source = tmp_path / "keywords.csv"
+    source.write_text(f"keyword,sort_order,max_results\nvalid,date,10\ninvalid,date,{value}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="第 3 行 max_results"):
+        parse_keywords_file(str(source))
+
+
+def test_keyword_csv_reports_row_for_invalid_sort_order(tmp_path):
+    source = tmp_path / "keywords.csv"
+    source.write_text("keyword,sort_order,max_results\ncamping,invalid,10\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="第 2 行 sort_order"):
+        parse_keywords_file(str(source))
+
+
+def test_keyword_csv_accepts_every_sort_order_supported_by_cli(tmp_path):
+    from main import YOUTUBE_SEARCH_ORDER_CHOICES
+
+    source = tmp_path / "keywords.csv"
+    source.write_text(
+        "keyword,sort_order,max_results\n" + "".join(
+            f"camping,{sort_order},10\n" for sort_order in YOUTUBE_SEARCH_ORDER_CHOICES
+        ),
+        encoding="utf-8",
+    )
+    assert [task.sort_order for task in parse_keywords_file(str(source))] == list(YOUTUBE_SEARCH_ORDER_CHOICES)

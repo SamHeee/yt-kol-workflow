@@ -10,7 +10,6 @@ tracking lookups, while all Feishu access is supplied through the configured
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import re
 from collections import Counter, defaultdict
@@ -22,13 +21,16 @@ from feishu.sample_logistics import (
     CARRIER_CODE_FIELD,
     CARRIER_FIELD,
     DELIVERED_DATE_FIELD,
+    DELIVERED_DATE_REVIEW_FIELD,
     ELIGIBLE_SAMPLE_STATUSES,
     LAST_QUERIED_AT_FIELD,
+    LAST_QUERY_SHIPMENT_KEY_FIELD,
     LATEST_EVENT_AT_FIELD,
     LATEST_PROGRESS_FIELD,
     LOGISTICS_STATUS_FIELD,
     LOGISTICS_STATUS_OPTIONS,
     QUERY_ERROR_FIELD,
+    PROVIDER_DELIVERED_AT_FIELD,
     REMINDER_ERROR_FIELD,
     REMINDER_EVENT_KEY_FIELD,
     REMINDER_SENT_AT_FIELD,
@@ -51,6 +53,11 @@ from logistics.base import (
     TrackingStatus,
     TrackingSyncStatus,
 )
+from logistics.shipment_identity import (
+    shipment_key as _shipment_key,
+    normalize_carrier as _normalize_carrier,
+    normalize_tracking_number as _normalize_number,
+)
 
 
 logger = logging.getLogger("kol_workflow.workflow.refresh_sample_logistics")
@@ -59,6 +66,7 @@ FEISHU_WRITE_BATCH_SIZE = 200
 MAX_ERROR_LENGTH = 500
 DEFAULT_STALE_HOURS = 20.0
 STAGNATION_HOURS = 72.0
+FAILED_QUERY_RETRY_HOURS = 5 / 60
 
 _ACCEPTED_REGISTRATION_OUTCOMES = frozenset({
     TrackingSyncStatus.SUCCESS.value,
@@ -159,7 +167,13 @@ def refresh_sample_logistics(
         if not record_id:
             skipped_counts["missing_record_id"] += 1
             continue
-        if sample_status not in ELIGIBLE_SAMPLE_STATUSES:
+        # Existing signed rows may need the new parcel-bound delivery field
+        # backfilled. Cancellation still remains an absolute terminal state.
+        delivery_backfill = (
+            sample_status == "已签收"
+            and _field_datetime(fields.get(PROVIDER_DELIVERED_AT_FIELD)) is None
+        )
+        if sample_status not in ELIGIBLE_SAMPLE_STATUSES and not delivery_backfill:
             skipped_counts["ineligible_status"] += 1
             continue
         if not tracking_number:
@@ -174,12 +188,18 @@ def refresh_sample_logistics(
         identity_changed = (
             field_to_text(fields.get(SYNCED_SHIPMENT_KEY_FIELD)) != shipment_key
         )
-        if not force and not identity_changed and _is_fresh(
-            fields.get(LAST_QUERIED_AT_FIELD),
-            current_time,
-            stale_hours=stale_hours,
+        retrying_failure = bool(field_to_text(fields.get(QUERY_ERROR_FIELD)))
+        fresh_hours = FAILED_QUERY_RETRY_HOURS if retrying_failure else stale_hours
+        attempted_key = field_to_text(fields.get(LAST_QUERY_SHIPMENT_KEY_FIELD)) or field_to_text(
+            fields.get(SYNCED_SHIPMENT_KEY_FIELD)
+        )
+        if (
+            not force
+            and attempted_key == shipment_key
+            and (retrying_failure or not identity_changed)
+            and _is_fresh(fields.get(LAST_QUERIED_AT_FIELD), current_time, stale_hours=fresh_hours)
         ):
-            skipped_counts["fresh"] += 1
+            skipped_counts["retry_backoff" if retrying_failure else "fresh"] += 1
             continue
         if limit is not None and len(candidates) >= limit:
             skipped_counts["limit"] += 1
@@ -334,7 +354,11 @@ def refresh_sample_logistics(
                 continue
             # Eligibility is part of the signature, but keep this explicit so
             # a future signature relaxation cannot overwrite cancelled rows.
-            if field_to_text(latest_fields.get(SAMPLE_STATUS_FIELD)) not in ELIGIBLE_SAMPLE_STATUSES:
+            latest_status = field_to_text(latest_fields.get(SAMPLE_STATUS_FIELD))
+            if latest_status not in ELIGIBLE_SAMPLE_STATUSES and not (
+                latest_status == "已签收"
+                and _field_datetime(latest_fields.get(PROVIDER_DELIVERED_AT_FIELD)) is None
+            ):
                 concurrent_skips += 1
                 skipped_counts["ineligible_before_write"] += 1
                 continue
@@ -422,9 +446,26 @@ def _plan_result(
     result_carrier = str(result.carrier or snapshot["carrier_code"] or "").strip()
     accepted = sync_status in _ACCEPTED_REGISTRATION_OUTCOMES
 
-    update_fields: Dict[str, Any] = {LAST_QUERIED_AT_FIELD: current_ms}
+    update_fields: Dict[str, Any] = {
+        LAST_QUERIED_AT_FIELD: current_ms,
+        LAST_QUERY_SHIPMENT_KEY_FIELD: _shipment_key(
+            provider_name, result_carrier, snapshot["tracking_number"]
+        ),
+    }
     if identity_changed:
         update_fields.update(_identity_reset_fields())
+
+    existing_delivery = _field_datetime(existing.get(DELIVERED_DATE_FIELD))
+    if existing_delivery is not None and (
+        identity_changed or not field_to_text(existing.get(DELIVERED_DATE_REVIEW_FIELD))
+    ):
+        update_fields[DELIVERED_DATE_REVIEW_FIELD] = "已有签收日期待人工确认"
+    elif (
+        existing_delivery is not None
+        and field_to_text(existing.get(DELIVERED_DATE_REVIEW_FIELD)) == "物流填写"
+        and existing_delivery != _field_datetime(existing.get(PROVIDER_DELIVERED_AT_FIELD))
+    ):
+        update_fields[DELIVERED_DATE_REVIEW_FIELD] = "签收日期已人工调整"
 
     if result_carrier and result_carrier != snapshot["carrier_code"]:
         update_fields[CARRIER_CODE_FIELD] = result_carrier
@@ -514,13 +555,17 @@ def _plan_result(
     )
     if delivered:
         update_fields[SAMPLE_STATUS_FIELD] = "已签收"
-        if _field_datetime(existing.get(DELIVERED_DATE_FIELD)) is None:
-            delivered_at = (
-                (event.event_time if event is not None else None)
-                or result.track_time
-                or current_time
-            )
-            update_fields[DELIVERED_DATE_FIELD] = _datetime_ms(delivered_at)
+        # A delivery reminder needs an actual delivery event, not the time at
+        # which a cached response was fetched. Unknown timestamps require
+        # confirmation rather than inventing a delivery date.
+        delivered_at = event.event_time if event is not None else None
+        if delivered_at is not None:
+            update_fields[PROVIDER_DELIVERED_AT_FIELD] = _datetime_ms(delivered_at)
+            if existing_delivery is None:
+                update_fields[DELIVERED_DATE_FIELD] = _datetime_ms(delivered_at)
+                update_fields[DELIVERED_DATE_REVIEW_FIELD] = "物流填写"
+        elif identity_changed or _field_datetime(existing.get(PROVIDER_DELIVERED_AT_FIELD)) is None:
+            update_fields[DELIVERED_DATE_REVIEW_FIELD] = "物流签收时间缺失待人工确认"
 
     return {
         "record_id": snapshot["record_id"],
@@ -550,6 +595,8 @@ def _identity_reset_fields() -> Dict[str, Any]:
         REMINDER_EVENT_KEY_FIELD: "",
         REMINDER_SENT_AT_FIELD: None,
         REMINDER_ERROR_FIELD: "",
+        PROVIDER_DELIVERED_AT_FIELD: None,
+        DELIVERED_DATE_REVIEW_FIELD: "",
     }
 
 
@@ -671,26 +718,8 @@ def _match_results_to_requests(
     return matched
 
 
-def _shipment_key(provider_name: str, carrier_code: str, tracking_number: str) -> str:
-    """Return a non-reversible, versioned identity for idempotent registration."""
-    raw = "\0".join((
-        str(provider_name or "").strip().lower(),
-        _normalize_carrier(carrier_code),
-        _normalize_number(tracking_number),
-    ))
-    return "v1:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
 def _group_key(carrier_code: Any, tracking_number: Any) -> Tuple[str, str]:
     return _normalize_carrier(carrier_code), _normalize_number(tracking_number)
-
-
-def _normalize_carrier(value: Any) -> str:
-    return str(value or "").strip().casefold()
-
-
-def _normalize_number(value: Any) -> str:
-    return re.sub(r"\s+", "", str(value or "")).casefold()
 
 
 def _map_logistics_status(value: Any) -> str:
@@ -762,6 +791,9 @@ def _source_signature(fields: Mapping[str, Any]) -> Tuple[str, ...]:
         field_to_text(fields.get(LATEST_EVENT_AT_FIELD)),
         field_to_text(fields.get(LATEST_PROGRESS_FIELD)),
         field_to_text(fields.get(LAST_QUERIED_AT_FIELD)),
+        field_to_text(fields.get(LAST_QUERY_SHIPMENT_KEY_FIELD)),
+        field_to_text(fields.get(PROVIDER_DELIVERED_AT_FIELD)),
+        field_to_text(fields.get(DELIVERED_DATE_REVIEW_FIELD)),
     )
 
 

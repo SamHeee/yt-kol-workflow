@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import pandas as pd
 
 from export.excel_exporter import ExcelExporter
@@ -31,12 +33,49 @@ def test_influencer_dedupe_merges_new_enrichment_fields():
         },
     ]
 
-    deduped, stats = _dedupe_rows(rows, "Channel ID", merge_nonblank=True)
+    deduped, stats = _dedupe_rows(
+        rows, "Channel ID", merge_nonblank=True,
+        now=datetime(2026, 7, 15, tzinfo=timezone.utc),
+    )
 
     assert stats["duplicate_rows_removed"] == 1
     assert deduped[0]["KOL Name"] == "Sarah"
     assert deduped[0]["断更评估"] == "持续更新"
     assert deduped[0]["频道初步判断"].startswith("领域=户外/露营")
+
+
+def test_summary_recalculates_activity_when_publication_date_has_not_changed():
+    rows = [
+        {"Channel ID": "UC1", "最新发布日期": "2026-09-01 00:00:00", "断更评估": "持续更新"},
+        {"Channel ID": "UC1", "最新发布日期": "2026-09-01 00:00:00", "断更评估": "有断更风险"},
+    ]
+    deduped, _ = _dedupe_rows(rows, "Channel ID", merge_nonblank=True, now=datetime(2026, 10, 20, tzinfo=timezone.utc))
+    assert deduped[0]["断更评估"] == "有断更风险"
+
+
+def test_summary_ages_single_observation_without_duplicate():
+    rows = [{"Channel ID": "UC1", "最新发布日期": "2026-09-01 00:00:00", "断更评估": "持续更新"}]
+    deduped, _ = _dedupe_rows(rows, "Channel ID", merge_nonblank=True, now=datetime(2026, 10, 20, tzinfo=timezone.utc))
+    assert deduped[0]["断更评估"] == "有断更风险"
+
+
+def test_summary_old_batch_after_new_batch_does_not_replace_latest_fetch_failure():
+    rows = [
+        {"Channel ID": "UC1", "最新发布日期": "2026-10-15 00:00:00", "断更评估": "待确认", "__observation_time__": 200},
+        {"Channel ID": "UC1", "最新发布日期": "2026-09-01 00:00:00", "断更评估": "持续更新", "__observation_time__": 100},
+    ]
+    deduped, _ = _dedupe_rows(rows, "Channel ID", merge_nonblank=True, now=datetime(2026, 10, 20, tzinfo=timezone.utc))
+    assert deduped[0]["最新发布日期"] == "2026-10-15 00:00:00"
+    assert deduped[0]["断更评估"] == "待确认"
+
+
+def test_summary_latest_success_can_replace_older_pending_assessment():
+    rows = [
+        {"Channel ID": "UC1", "最新发布日期": "2026-10-15 00:00:00", "断更评估": "待确认", "__observation_time__": 100},
+        {"Channel ID": "UC1", "最新发布日期": "2026-10-15 00:00:00", "断更评估": "持续更新", "__observation_time__": 200},
+    ]
+    deduped, _ = _dedupe_rows(rows, "Channel ID", merge_nonblank=True, now=datetime(2026, 10, 20, tzinfo=timezone.utc))
+    assert deduped[0]["断更评估"] == "持续更新"
 
 
 def test_influencer_dedupe_never_downgrades_confirmed_name():

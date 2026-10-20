@@ -32,7 +32,7 @@ from feishu.sample_logistics import (
     CARRIER_CODE_FIELD,
     CARRIER_FIELD,
     CONTACT_EMAIL_FIELD,
-    DELIVERED_DATE_FIELD,
+    PROVIDER_DELIVERED_AT_FIELD,
     ELIGIBLE_SAMPLE_STATUSES,
     KOL_NAME_FIELD,
     LAST_QUERIED_AT_FIELD,
@@ -55,6 +55,7 @@ from feishu.sample_logistics import (
     validate_reminder_update_fields,
 )
 from feishu.value_utils import field_to_text
+from logistics.shipment_identity import shipment_is_current
 from notifications.feishu_cli import (
     FeishuCliAmbiguousDeliveryError,
     FeishuCliNotificationError,
@@ -459,6 +460,16 @@ def plan_sample_reminders(
         fields = record.get("fields") or {}
         existing_key = field_to_text(fields.get(REMINDER_EVENT_KEY_FIELD))
         existing_status = field_to_text(fields.get(REMINDER_STATUS_FIELD))
+        if (
+            candidate.reminder_type == DELIVERY_REMINDER
+            and field_to_text(fields.get(REMINDER_TYPE_FIELD)) == DELIVERY_REMINDER
+            and existing_status == REMINDER_SENT
+        ):
+            # A verified delivery-time correction (including migration from
+            # a historical manual date) is still the same parcel's delivery.
+            # A changed parcel is excluded above until refresh resets state.
+            skipped["already_sent"] += 1
+            continue
         if existing_key == candidate.event_key:
             if existing_status == REMINDER_SENT:
                 skipped["already_sent"] += 1
@@ -625,10 +636,15 @@ def _candidate_for_record(
     if sample_status == "已取消":
         return None, "sample_status_ineligible"
 
+    if not shipment_is_current(
+        field_to_text(fields.get(CARRIER_CODE_FIELD)),
+        field_to_text(fields.get(TRACKING_NUMBER_FIELD)),
+        field_to_text(fields.get(SYNCED_SHIPMENT_KEY_FIELD)),
+    ):
+        return None, "shipment_changed_or_unsynced"
+
     if logistics_status == DELIVERED_STATUS:
-        delivered_at = _parse_datetime(fields.get(DELIVERED_DATE_FIELD))
-        if delivered_at is None:
-            delivered_at = _parse_datetime(fields.get(LATEST_EVENT_AT_FIELD))
+        delivered_at = _parse_datetime(fields.get(PROVIDER_DELIVERED_AT_FIELD))
         if delivered_at is None:
             return None, "delivered_time_missing"
         delivered_day = delivered_at.astimezone(BEIJING_TZ).date()

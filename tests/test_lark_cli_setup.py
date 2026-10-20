@@ -6,6 +6,7 @@ import pytest
 
 from feishu.lark_cli import (
     BrowserLaunchError,
+    FULL_WORKSPACE_SCOPES,
     LarkCliCommandError,
     LarkCliManager,
     LarkCliRuntimeError,
@@ -282,9 +283,57 @@ def test_ensure_full_workspace_scopes_requests_only_explicit_scope_set():
     login = next(command for command in calls if "--no-wait" in command)
     assert "--scope" in login
     scope_value = login[login.index("--scope") + 1]
-    assert "base:workflow:write" in scope_value
-    assert "bitable:app" in scope_value
+    assert set(scope_value.split()) == {
+        "bitable:app", "base:workflow:create", "base:workflow:read", "base:workflow:update",
+    }
+    assert "base:workflow:write" not in scope_value
     assert "--recommend" not in login
+
+
+def test_documented_full_workspace_scopes_do_not_trigger_unneeded_authorization():
+    """Both CLI v1.0.70/v1.0.88 use update for Workflow enable/disable."""
+    granted = {"bitable:app", "base:workflow:create", "base:workflow:read", "base:workflow:update"}
+    calls = []
+
+    def runner(args, **kwargs):
+        calls.append(args)
+        assert "check" in args, "Already granted documented scopes must not trigger login"
+        requested = set(args[args.index("--scope") + 1].split())
+        missing = requested - granted
+        return completed(args, 1 if missing else 0, json.dumps({"ok": not missing, "data": {"missing_scopes": sorted(missing)}}))
+
+    manager = LarkCliManager(
+        cli_path="/bin/lark-cli", path_exists=lambda _path: True, runner=runner,
+        open_browser=lambda _url: pytest.fail("must not open a browser"),
+    )
+    manager.ensure_full_workspace_scopes()
+    assert len(calls) == 1
+    assert set(calls[0][calls[0].index("--scope") + 1].split()) == granted
+
+
+@pytest.mark.parametrize("missing_scope", FULL_WORKSPACE_SCOPES)
+def test_every_real_full_workspace_scope_is_still_required(missing_scope):
+    calls = []
+
+    def runner(args, **kwargs):
+        calls.append(args)
+        requested = set(args[args.index("--scope") + 1].split())
+        assert missing_scope in requested
+        return completed(args, 1, json.dumps({"ok": False, "error": {"missing_scopes": [missing_scope]}}))
+
+    manager = LarkCliManager(cli_path="/bin/lark-cli", path_exists=lambda _path: True, runner=runner)
+    assert manager.full_workspace_scopes_valid() is False
+    assert len(calls) == 1
+
+
+def test_missing_real_scope_after_authorization_is_not_silently_accepted(monkeypatch):
+    manager = LarkCliManager(cli_path="/bin/lark-cli", path_exists=lambda _path: True)
+    authorizations = []
+    monkeypatch.setattr(manager, "full_workspace_scopes_valid", lambda: False)
+    monkeypatch.setattr(manager, "_authorize", lambda cli, *, scopes: authorizations.append(tuple(scopes)))
+    with pytest.raises(LarkCliCommandError, match="full workspace scopes are still missing"):
+        manager.ensure_full_workspace_scopes()
+    assert authorizations == [FULL_WORKSPACE_SCOPES]
 
 
 def test_nested_verified_false_is_not_treated_as_authorized():

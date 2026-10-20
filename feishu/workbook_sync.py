@@ -131,7 +131,7 @@ TABLE_CONFIGS: Dict[str, Dict[str, Any]] = {
         "field_map": _identity_field_map(feishu_schema.INFLUENCERS_FIELDS),
         "header_aliases": LEGACY_HEADER_ALIASES["influencers"],
         "read_only_fields": _read_only_fields(feishu_schema.INFLUENCERS_FIELDS),
-        "preserve_existing_nonblank": {"联系邮箱", "邮箱状态", "开发状态", "开发负责人", "备注"},
+        "preserve_existing_nonblank": {"联系邮箱", "开发状态", "开发负责人", "备注"},
     },
     "influencer_videos": {
         "sheet": "influencer_videos",
@@ -374,12 +374,27 @@ def build_fields(
             source_row.get(source_column),
         ):
             continue
-        formatted = format_value(source_row.get(source_column), target_field, field_meta[target_field])
+        source_value = source_row.get(source_column)
+        if target_field == "邮箱状态":
+            source_value = _email_status(source_row, config, existing_fields)
+        formatted = format_value(source_value, target_field, field_meta[target_field])
         if formatted is None or is_blank(formatted):
             continue
         fields[target_field] = formatted
 
     return fields
+
+
+def _email_status(
+    source_row: Dict[str, Any], config: Dict[str, Any], existing_fields: Dict[str, Any],
+) -> str:
+    """Derive status from the email that will survive this update."""
+    email_column = next(
+        (source for source, target in config["field_map"].items() if target == "联系邮箱"),
+        "联系邮箱",
+    )
+    adopted_email = field_to_text(existing_fields.get("联系邮箱")) or clean_text(source_row.get(email_column))
+    return "已获取" if adopted_email else "需手动查找"
 
 
 def plan_table(
@@ -648,7 +663,10 @@ def verify_table(
                 row.get(source_column),
             ):
                 continue
-            expected = expected_value(row.get(source_column), target_field, field_meta[target_field])
+            source_value = row.get(source_column)
+            if target_field == "邮箱状态":
+                source_value = _email_status(row, config, fields)
+            expected = expected_value(source_value, target_field, field_meta[target_field])
             if expected is None:
                 continue
             actual = comparable_value(fields.get(target_field), field_meta[target_field])

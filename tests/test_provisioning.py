@@ -392,7 +392,7 @@ def test_missing_required_select_options_are_planned_and_added_safely():
                     "field_id": "fld-select",
                     "type": 3,
                     "multiple": False,
-                    "default_value": None,
+                    "default_value": ["自定义"],
                     "options": [
                         {
                             "id": "opt-ok",
@@ -420,7 +420,7 @@ def test_missing_required_select_options_are_planned_and_added_safely():
     update = next(call for call in admin.calls if call[0] == "update_field")
     payload = update[3]
     assert "id" not in payload
-    assert "default_value" not in payload
+    assert payload["default_value"] == ["自定义"]
     assert payload["options"] == [
         {"name": "成功", "hue": "Green", "lightness": "Light"},
         {"name": "自定义", "color": 7},
@@ -432,6 +432,83 @@ def test_missing_required_select_options_are_planned_and_added_safely():
     assert by_name["成功"]["id"] == "opt-ok"
     assert by_name["自定义"]["id"] == "opt-extra"
     assert provisioner.plan(include_workflow=False).mutation_count == 0
+
+
+@pytest.mark.parametrize("default", [None, [], ["成功"]])
+def test_select_option_update_preserves_legal_default_in_full_put(default):
+    admin = FakeAdmin(
+        tables=[{"name": "搜索任务表", "table_id": "tbl-1"}],
+        fields={"tbl-1": [
+            {"field_name": "多行文本", "field_id": "fld-1", "type": 1},
+            {"field_name": "执行状态", "field_id": "fld-select", "type": "select",
+             "multiple": False, "description": "保留描述", "default_value": default,
+             "options": [{"name": "成功", "hue": "Green", "lightness": "Light"}]},
+        ]},
+    )
+    SevenTableProvisioner(admin, schema=_select_schema()).apply(include_workflow=False)
+    payload = next(call[3] for call in admin.calls if call[0] == "update_field")
+    assert "default_value" in payload and payload["default_value"] == default
+    assert payload["description"] == "保留描述"
+    assert payload["options"][0] == {"name": "成功", "hue": "Green", "lightness": "Light"}
+
+
+@pytest.mark.parametrize("default", ["成功", ["不存在"], ["成功", "成功"], ["成功", "自定义"], [1]])
+def test_invalid_select_default_blocks_metadata_changes(default):
+    admin = FakeAdmin(
+        tables=[{"name": "搜索任务表", "table_id": "tbl-1"}],
+        fields={"tbl-1": [
+            {"field_name": "多行文本", "field_id": "fld-1", "type": 1},
+            {"field_name": "执行状态", "field_id": "fld-select", "type": "select",
+             "multiple": False, "default_value": default,
+             "options": [{"name": "成功"}, {"name": "自定义"}]},
+        ]},
+    )
+    with pytest.raises(ProvisioningConflict, match="默认值"):
+        SevenTableProvisioner(admin, schema=_select_schema()).apply(include_workflow=False)
+    assert admin.calls == []
+
+
+def test_select_update_detects_default_cleared_by_server():
+    admin = FakeAdmin(
+        tables=[{"name": "搜索任务表", "table_id": "tbl-1"}],
+        fields={"tbl-1": [
+            {"field_name": "多行文本", "field_id": "fld-1", "type": 1},
+            {"field_name": "执行状态", "field_id": "fld-select", "type": "select",
+             "multiple": False, "default_value": ["成功"], "options": [{"name": "成功"}]},
+        ]},
+    )
+    original = admin.update_field
+
+    def update(table_id, field_id, payload):
+        result = original(table_id, field_id, payload)
+        admin.fields[table_id][1].pop("default_value", None)
+        return result
+
+    admin.update_field = update
+    with pytest.raises(RuntimeError, match="default_value 未保留"):
+        SevenTableProvisioner(admin, schema=_select_schema()).apply(include_workflow=False)
+
+
+@pytest.mark.parametrize("payload", [
+    {}, {"unknown": []}, {"items": "invalid"}, {"items": [None]},
+    {"ok": False, "error": {"code": "denied"}},
+])
+def test_unknown_table_inventory_blocks_all_provisioning_writes(payload):
+    admin = FakeAdmin()
+    admin.list_tables = lambda: payload
+    with pytest.raises(ProvisioningConflict):
+        SevenTableProvisioner(admin, schema=SCHEMA).apply(include_workflow=False)
+    assert admin.calls == []
+
+
+def test_confirmed_null_workflow_list_allows_initial_provisioning_plan():
+    admin = FakeAdmin()
+    admin.list_workflows = lambda: {"ok": True, "data": {"items": None, "total": 0}}
+    plan = SevenTableProvisioner(admin, schema=SCHEMA).plan()
+    assert plan.safe
+    assert [(action.kind, action.target) for action in plan.actions] == [
+        ("create_table", "搜索任务表"), ("create_workflow", SCHEMA.workflow_title),
+    ]
 
 
 def test_duplicate_existing_select_options_are_conflict_before_writes():

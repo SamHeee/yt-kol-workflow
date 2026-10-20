@@ -470,3 +470,44 @@ def test_empty_batch_makes_no_http_request():
     assert client.register([]) == []
     assert client.get_track_info([]) == []
     assert session.calls == []
+
+
+def test_second_tracking_batch_failure_preserves_first_batch_success():
+    numbers = [f"TRACK{i:05d}" for i in range(41)]
+    session = FakeSession([
+        _ok(accepted=[{"number": number, "sync_status": True} for number in numbers[:40]]),
+        FakeResponse(503, {}),
+    ])
+    client = SeventeenTrackClient("key", session=session, max_retries=0)
+    results = client.get_track_info([TrackingRequest(number) for number in numbers])
+    assert len(results) == 41
+    assert all(item.sync_status is TrackingSyncStatus.SUCCESS for item in results[:40])
+    assert results[-1].number == numbers[-1]
+    assert results[-1].sync_status is TrackingSyncStatus.API_ERROR
+
+
+def test_failed_registration_batch_is_not_queried_and_keeps_other_successes():
+    numbers = [f"TRACK{i:05d}" for i in range(41)]
+    session = FakeSession([
+        _ok(accepted=[{"number": number} for number in numbers[:40]]),
+        FakeResponse(503, {}),
+        _ok(accepted=[{"number": number, "sync_status": True} for number in numbers[:40]]),
+    ])
+    client = SeventeenTrackClient("key", session=session, max_retries=0)
+    results = client.refresh([TrackingRequest(number) for number in numbers], register_first=True)
+    assert len(results) == 41
+    assert sum(item.sync_status is TrackingSyncStatus.SUCCESS for item in results) == 40
+    assert sum(item.sync_status is TrackingSyncStatus.API_ERROR for item in results) == 1
+    assert len(session.calls[-1]["json"]) == 40
+
+
+def test_already_registered_result_can_recover_current_tracking_data():
+    session = FakeSession([
+        _ok(rejected=[{"number": "TRACK12345", "error": {"code": -1, "message": "Tracking number already registered"}}]),
+        _ok(accepted=[{"number": "TRACK12345", "sync_status": True}]),
+    ])
+    results = SeventeenTrackClient("key", session=session).refresh(
+        [TrackingRequest("TRACK12345")], register_first=True
+    )
+    assert len(results) == 1
+    assert results[0].sync_status is TrackingSyncStatus.SUCCESS

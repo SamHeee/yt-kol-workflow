@@ -46,6 +46,9 @@ REMINDER_STATUS_FIELD = "提醒状态"
 REMINDER_EVENT_KEY_FIELD = "提醒事件键"
 REMINDER_SENT_AT_FIELD = "提醒发送时间"
 REMINDER_ERROR_FIELD = "提醒错误"
+PROVIDER_DELIVERED_AT_FIELD = "物流签收时间"
+DELIVERED_DATE_REVIEW_FIELD = "签收日期核验状态"
+LAST_QUERY_SHIPMENT_KEY_FIELD = "上次查询运单键"
 
 
 # Feishu field type IDs: text=1, number=2, single-select=3, date=5,
@@ -82,6 +85,9 @@ SAMPLE_LOGISTICS_FIELDS: List[Tuple[str, int]] = [
     (REMINDER_EVENT_KEY_FIELD, 1),
     (REMINDER_SENT_AT_FIELD, 5),
     (REMINDER_ERROR_FIELD, 1),
+    (PROVIDER_DELIVERED_AT_FIELD, 5),
+    (DELIVERED_DATE_REVIEW_FIELD, 1),
+    (LAST_QUERY_SHIPMENT_KEY_FIELD, 1),
 ]
 
 SAMPLE_STATUS_OPTIONS: Tuple[str, ...] = (
@@ -125,6 +131,9 @@ TERMINAL_SAMPLE_STATUSES = frozenset({"已签收", "已取消"})
 # a changed tracking number can atomically discard reminders belonging to the
 # old parcel.
 LOGISTICS_WRITABLE_FIELDS = frozenset({
+    LAST_QUERY_SHIPMENT_KEY_FIELD,
+    PROVIDER_DELIVERED_AT_FIELD,
+    DELIVERED_DATE_REVIEW_FIELD,
     SAMPLE_STATUS_FIELD,
     DELIVERED_DATE_FIELD,
     CARRIER_CODE_FIELD,
@@ -300,6 +309,7 @@ def metadata_errors(
         SOURCE_SYNCED_AT_FIELD: "yyyy-MM-dd HH:mm",
         LAST_QUERIED_AT_FIELD: "yyyy-MM-dd HH:mm",
         REMINDER_SENT_AT_FIELD: "yyyy-MM-dd HH:mm",
+        PROVIDER_DELIVERED_AT_FIELD: "yyyy-MM-dd HH:mm",
     }
     for field_name, formatter in date_fields.items():
         property_value = (by_name.get(field_name) or {}).get("property") or {}

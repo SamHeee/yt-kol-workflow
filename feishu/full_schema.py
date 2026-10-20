@@ -483,6 +483,7 @@ SAMPLE_FIELD_PROPERTIES = {
     "收件信息": {"lookup": SAMPLE_LOOKUP_SPECS["收件信息"]},
     "发货日期": {"date_format": "yyyy-MM-dd"},
     "签收日期": {"date_format": "yyyy-MM-dd"},
+    "物流签收时间": {"date_format": "yyyy-MM-dd HH:mm"},
     "最新物流时间": {"date_format": "yyyy-MM-dd HH:mm"},
     "物流停滞起算时间": {"date_format": "yyyy-MM-dd HH:mm"},
     "物流源同步时间": {"date_format": "yyyy-MM-dd HH:mm"},
