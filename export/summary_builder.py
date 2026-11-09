@@ -133,7 +133,7 @@ def _read_excel_rows(path: Path) -> Tuple[List[str], List[Dict[str, Any]]]:
     df = pd.read_excel(path, dtype=object)
     df = df.where(pd.notna(df), None)
     headers = [str(column) for column in df.columns]
-    return headers, df.to_dict(orient="records")
+    return headers, excel_exporter.read_snapshot_metadata(path, df.to_dict(orient="records"))
 
 
 def _observation_time(path: Path) -> float:
@@ -157,6 +157,8 @@ def _normalize_source_row(table_key: str, source_row: Dict[str, Any]) -> Dict[st
     expected_headers = TABLE_SPECS[table_key]["expected_headers"]
     aliases = LEGACY_HEADER_ALIASES.get(table_key, {})
     normalized = {header: source_row.get(header) for header in expected_headers}
+    if "__recent_snapshot__" in source_row:
+        normalized["__recent_snapshot__"] = source_row["__recent_snapshot__"]
 
     # Exact/new headers take precedence.  A legacy alias only fills a blank
     # canonical cell, preventing old/new columns from surviving side-by-side.
@@ -292,6 +294,7 @@ def _merge_influencer_row(
     fill its blank cells from later rows and prefer a confirmed KOL name over
     the ``手动确认`` placeholder.
     """
+    original_target_observed = target.get(_OBSERVATION_TIME)
     current_name = clean_text(target.get("KOL Name"))
     incoming_name = clean_text(incoming.get("KOL Name"))
     if incoming_name and incoming_name != "手动确认" and current_name in {"", "手动确认"}:
@@ -318,8 +321,26 @@ def _merge_influencer_row(
         if not is_blank(incoming.get("断更评估")):
             target["断更评估"] = incoming["断更评估"]
 
+    from workflow.recent_video_metrics import METRIC_FIELDS
+    def metric_time(row):
+        snapshot = row.get("__recent_snapshot__") or {}
+        value = pd.to_datetime(snapshot.get("recent_video_observed_at"), errors="coerce", utc=True)
+        return value.timestamp() if pd.notna(value) else (original_target_observed if row is target else row.get(_OBSERVATION_TIME))
+    def complete_metrics(row):
+        return (row.get("__recent_snapshot__") or {}).get("status") == "success" or all(
+            not is_blank(row.get(name)) for name in METRIC_FIELDS)
+    target_time, incoming_time = metric_time(target), metric_time(incoming)
+    if complete_metrics(incoming) and (not complete_metrics(target) or (
+            incoming_time is not None and (target_time is None or incoming_time >= target_time))):
+        for name in METRIC_FIELDS:
+            target[name] = incoming.get(name)
+        if "__recent_snapshot__" in incoming:
+            target["__recent_snapshot__"] = incoming["__recent_snapshot__"]
+        else:
+            target.pop("__recent_snapshot__", None)
+
     for column, value in incoming.items():
-        if column in {"KOL Name", "最新发布日期", "断更评估", _OBSERVATION_TIME}:
+        if column in {"KOL Name", "最新发布日期", "断更评估", _OBSERVATION_TIME, "__recent_snapshot__", *METRIC_FIELDS}:
             continue
         if is_blank(target.get(column)) and not is_blank(value):
             target[column] = value
@@ -369,6 +390,8 @@ def _write_workbook(
             df = pd.DataFrame(matrix, columns=headers)
             df.to_excel(writer, index=False, sheet_name=table_key)
             excel_exporter._style_worksheet(writer.sheets[table_key], field_types)
+            if table_key == "influencers":
+                excel_exporter.write_snapshot_metadata(writer.sheets[table_key], table["rows"])
 
         provenance_matrix = [
             {header: _normalize_cell(row.get(header)) for header in PROVENANCE_COLUMNS}

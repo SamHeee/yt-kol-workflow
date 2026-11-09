@@ -41,7 +41,7 @@ NEW_FIELD_NAMES = [
     [
         (SEARCH_TASKS_FIELDS, SEARCH_TASK_COLUMNS, 13),
         (SEARCH_VIDEOS_FIELDS, SEARCH_VIDEO_COLUMNS, 20),
-        (INFLUENCERS_FIELDS, INFLUENCER_COLUMNS, 25),
+        (INFLUENCERS_FIELDS, INFLUENCER_COLUMNS, 28),
         (INFLUENCER_VIDEOS_FIELDS, INFLUENCER_VIDEO_COLUMNS, 16),
     ],
 )
@@ -58,7 +58,7 @@ def test_excel_headers_are_derived_from_feishu_schema(
 
 def test_influencer_schema_and_excel_column_order():
     schema_names = [name for name, _field_type in INFLUENCERS_FIELDS]
-    assert len(schema_names) == 25
+    assert len(schema_names) == 28
     assert schema_names[:8] == [
         "多行文本",
         "Channel ID",
@@ -78,7 +78,7 @@ def test_influencer_schema_and_excel_column_order():
     assert dict(INFLUENCERS_FIELDS)["网红记录日期"] == 1001
 
     excel_headers = list(INFLUENCER_COLUMNS.values())
-    assert len(excel_headers) == 25
+    assert len(excel_headers) == 28
     assert excel_headers[:8] == [
         "多行文本",
         "Channel ID",

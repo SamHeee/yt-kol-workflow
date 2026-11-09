@@ -48,7 +48,10 @@ def test_refresh_updates_only_enrichment_and_preserves_confirmed_name(monkeypatc
             "uploads_playlist_id": "UU1",
         }], ""),
     )
-    monkeypatch.setattr(refresh_module, "get_channel_uploads", lambda **kwargs: (["recent00001"], ""))
+    monkeypatch.setattr(refresh_module, "collect_recent_videos", lambda *args, **kwargs: ([{
+        "video_id": "recent00001", "channel_id": "UC1", "view_count": 100,
+        "title": "Camping Gear Review", "published_at_raw": "2026-07-01T00:00:00Z"}], ""))
+    monkeypatch.setattr(refresh_module, "save_sample", lambda *args: 1)
     monkeypatch.setattr(
         refresh_module,
         "fetch_video_details",
@@ -74,6 +77,7 @@ def test_refresh_updates_only_enrichment_and_preserves_confirmed_name(monkeypatc
         api_key="key",
         client=client,
         table_id="table",
+        videos_table_id="videos",
     )
 
     assert result["actual_updates"] == 1

@@ -32,19 +32,19 @@ def _new_channel():
 
 def test_phase_d_populates_all_enrichment_fields(monkeypatch):
     monkeypatch.setattr(phase_d_detail, "fetch_channel_details", lambda **kwargs: ([_channel()], ""))
-    monkeypatch.setattr(phase_d_detail, "get_channel_uploads", lambda **kwargs: (["recent00001"], ""))
     monkeypatch.setattr(
         phase_d_detail,
-        "fetch_video_details",
-        lambda **kwargs: ([{
+        "collect_recent_videos",
+        lambda *args, **kwargs: ([{
             "video_id": "recent00001",
+            "view_count": 1250,
             "channel_id": "UC1",
             "title": "Camping Chair Review Tutorial",
             "tags": "camping,review,tutorial",
             "published_at": "2026-07-01 00:00:00",
             "published_at_raw": "2026-07-01T00:00:00Z",
             "live_broadcast_content": "none",
-        }], [], ""),
+        }], ""),
     )
 
     details, videos, error = phase_d_detail.run_phase_d("key", [_new_channel()])
@@ -56,12 +56,14 @@ def test_phase_d_populates_all_enrichment_fields(monkeypatch):
     assert details[0]["activity_status"] in {"持续更新", "有断更风险"}
     assert details[0]["latest_published_at"] == "2026-07-01 00:00:00"
     assert details[0]["channel_initial_assessment"].startswith("领域=户外/露营")
+    assert details[0]["recent_video_mean_views"] == 1250
+    assert details[0]["recent_video_sample_count"] == 1
     assert videos[0]["channel_title"] == "Sarah Jones"
 
 
 def test_phase_d_marks_activity_pending_on_recent_video_error(monkeypatch):
     monkeypatch.setattr(phase_d_detail, "fetch_channel_details", lambda **kwargs: ([_channel()], ""))
-    monkeypatch.setattr(phase_d_detail, "get_channel_uploads", lambda **kwargs: ([], "temporary failure"))
+    monkeypatch.setattr(phase_d_detail, "collect_recent_videos", lambda *args, **kwargs: ([], "temporary failure"))
 
     details, _, error = phase_d_detail.run_phase_d("key", [_new_channel()])
 

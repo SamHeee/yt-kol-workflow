@@ -5,6 +5,10 @@
 from __future__ import annotations
 
 import logging
+import json
+from openpyxl.comments import Comment
+from openpyxl import load_workbook
+from workflow.recent_video_metrics import METRIC_FIELDS
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -121,6 +125,9 @@ INFLUENCER_COLUMNS = _columns_from_schema(
         "频道描述": "channel_description",
         "频道初步判断": "channel_initial_assessment",
         "联系邮箱": "contact_email",
+        "apify邮箱": "apify_email",
+        "最近视频平均播放量": "recent_video_mean_views",
+        "最近视频中位播放量": "recent_video_median_views",
         "邮箱状态": "email_status",
         "代表视频URL": "rep_video_url",
         "代表视频标题": "rep_video_title",
@@ -324,6 +331,8 @@ def export_to_excel(
         row = {}
         for source, header in columns.items():
             raw_value = _find_value(item, source, header)
+            if header == "Views" and item.get("view_count_available") is False:
+                raw_value = None
             row[header] = _coerce_excel_value(raw_value, types.get(header))
         rows.append(row)
 
@@ -333,9 +342,53 @@ def export_to_excel(
         df.to_excel(writer, index=False, sheet_name=sheet_name)
         ws = writer.sheets[sheet_name]
         _style_worksheet(ws, types)
+        write_snapshot_metadata(ws, data)
 
     logger.info(f"Excel 导出: {path} ({len(data)} 条)")
     return str(path.resolve())
+
+
+def write_snapshot_metadata(ws, rows):
+    """Preserve empty-success vs unknown in a comment, without extra columns."""
+    headers = [c.value for c in ws[1]]
+    if METRIC_FIELDS[0] not in headers or "Channel ID" not in headers:
+        return
+    column = headers.index(METRIC_FIELDS[0]) + 1
+    for index, row in enumerate(rows, 2):
+        snapshot = row.get("__recent_snapshot__")
+        if snapshot is None and row.get("recent_video_metrics_status") == "success":
+            snapshot = {k: row[k] for k in ("recent_video_observed_at", "recent_video_sample_count") if k in row}
+            snapshot["status"] = "success"
+        if snapshot and snapshot.get("status") == "success":
+            payload = {"version": 1, "channel_id": row.get("channel_id") or row.get("Channel ID"), **snapshot}
+            ws.cell(index, column).comment = Comment(json.dumps(payload, ensure_ascii=False), "yt-kol-workflow")
+
+
+def read_snapshot_metadata(path, rows, sheet_name=0):
+    if not rows or METRIC_FIELDS[0] not in rows[0]:
+        return rows
+    book = load_workbook(path, read_only=False, data_only=True)
+    try:
+        ws = book.worksheets[sheet_name] if isinstance(sheet_name, int) else book[sheet_name]
+        headers = [c.value for c in ws[1]]
+        if METRIC_FIELDS[0] not in headers:
+            return rows
+        column = headers.index(METRIC_FIELDS[0]) + 1
+        for index, row in enumerate(rows, 2):
+            comment = ws.cell(index, column).comment
+            if comment is None or comment.author != "yt-kol-workflow":
+                continue
+            try:
+                snapshot = json.loads(comment.text)
+            except (ValueError, TypeError):
+                continue
+            if (isinstance(snapshot, dict) and snapshot.get("version") == 1
+                    and snapshot.get("status") == "success"
+                    and snapshot.get("channel_id") == row.get("Channel ID")):
+                row["__recent_snapshot__"] = snapshot
+        return rows
+    finally:
+        book.close()
 
 
 def _style_worksheet(ws, field_types: Optional[Mapping[str, int]] = None):
@@ -368,6 +421,11 @@ def _style_worksheet(ws, field_types: Optional[Mapping[str, int]] = None):
                         current_height,
                         wrapped_lines * 15,
                     )
+                if row_idx and field_type == 2:
+                    if header in {"Views", "Likes", "Comments", "订阅数", "频道总播放量", "视频总数", "代表视频播放量"}:
+                        cell.number_format = "#,##0"
+                    elif header in {"最近视频平均播放量", "最近视频中位播放量"}:
+                        cell.number_format = "#,##0.00"
                 if row_idx and field_type in {5, 1001} and value not in {None, ""}:
                     cell.number_format = "yyyy-mm-dd hh:mm:ss"
                 if row_idx and field_type == 15 and isinstance(value, str) and value.startswith(("http://", "https://")):

@@ -6,7 +6,8 @@ import logging
 from typing import List, Dict, Tuple
 
 from youtube.channels import fetch_channel_details
-from youtube.playlists import get_channel_uploads
+from youtube.recent_videos import collect_recent_videos
+from workflow.recent_video_metrics import calculate_recent_metrics
 from youtube.search import search_channel_videos
 from youtube.videos import fetch_video_details
 from filter.activity_evaluator import evaluate_channel_activity
@@ -139,23 +140,19 @@ def run_phase_d(
         ctitle = ch.get("channel_title", "")
         detail = detail_by_channel.get(cid, {})
 
-        # Get recent video IDs
+        videos = []
         if use_playlist:
-            video_ids, err = get_channel_uploads(
-                api_key=api_key,
-                channel_id=cid,
-                uploads_playlist_id=ch.get("uploads_playlist_id", ""),
-                max_results=recent_video_count,
-                quota_tracker=quota_tracker,
+            videos, err = collect_recent_videos(
+                api_key, cid, uploads_playlist_id=ch.get("uploads_playlist_id", ""),
+                count=recent_video_count, quota_tracker=quota_tracker,
             )
         else:
             video_ids, err = search_channel_videos(
-                api_key=api_key,
-                channel_id=cid,
-                max_results=recent_video_count,
-                order="date",
-                quota_tracker=quota_tracker,
+                api_key=api_key, channel_id=cid, max_results=recent_video_count,
+                order="date", quota_tracker=quota_tracker,
             )
+            if not err and video_ids:
+                videos, _, err = fetch_video_details(api_key, video_ids, quota_tracker=quota_tracker)
 
         if err:
             detail.update(evaluate_channel_activity([], fetch_error=err))
@@ -166,27 +163,15 @@ def run_phase_d(
             errors.append(f"{cid}: {err}")
             continue
 
-        if not video_ids:
-            logger.warning(f"频道 {ctitle} 无最近视频")
+        try:
+            detail.update(calculate_recent_metrics(videos, channel_id=cid))
+        except ValueError as exc:
+            errors.append(f"{cid}: {exc}")
+            continue
+        if not videos:
             detail.update(evaluate_channel_activity([]))
             if state:
                 state.commit_channel(cid, detail, [])
-            continue
-
-        # Fetch video details
-        videos, _, err = fetch_video_details(
-            api_key=api_key,
-            video_ids=video_ids,
-            quota_tracker=quota_tracker,
-        )
-
-        if err:
-            detail.update(evaluate_channel_activity([], fetch_error=err))
-            if _is_quota_error(err):
-                logger.error(f"频道 {ctitle} 视频详情获取时配额耗尽: {err}")
-                return influencer_details, all_influencer_videos, err
-            logger.warning(f"频道 {ctitle} 视频详情获取失败: {err}")
-            errors.append(f"{cid}: {err}")
             continue
         else:
             # Enrich with channel title
@@ -220,6 +205,7 @@ def _is_quota_error(error: str) -> bool:
         "quotaexceeded" in text
         or "dailylimitexceeded" in text
         or "配额已耗尽" in text
+        or "quota budget exhausted" in text
     )
 
 
