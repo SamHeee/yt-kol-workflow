@@ -69,10 +69,11 @@ def test_existing_four_table_excel_contract_is_unchanged():
         for field in influencer.fields[:original_count]
     ] == INFLUENCERS_FIELDS
     assert tuple(field.name for field in influencer.fields[original_count:]) == (
+        "邮件主题",
         "邮箱索引",
         "开发信",
     )
-    assert len(INFLUENCERS_FIELDS) == 25
+    assert len(INFLUENCERS_FIELDS) == 28
 
 
 def test_every_table_has_only_one_unfiltered_default_grid_contract():
@@ -177,19 +178,17 @@ def test_formula_and_auto_number_contracts_are_fully_declared():
 
 
 def test_outreach_letter_template_is_verbatim_and_formula_is_dynamic_and_gated():
-    assert OUTREACH_LETTER_TEMPLATE == '''Hello “KOL Name”,
+    assert OUTREACH_LETTER_TEMPLATE == '''Hello KOL Name,
 
-This is Sam from Brand. We came across your video "代表视频标题" and found it very helpful.
+This is Sam from xxx, a brand that makes xxx. We came across your video "代表视频标题" and found it very helpful.
 
-**Here are a few highlights:**
-1.
-2.
-3.
+We'd like to propose a gifted collaboration: we'll send you a free [product] to keep, and in return you'd share your honest thoughts in a dedicated video or a short integration in an upcoming one, whichever works best for your channel.
 
-We'd be glad to send you a free sample. Would you be interested in doing a review video?
+If this sounds good, reply with your shipping address and a rough idea of when you could post.
 
-Best regards,
-Sam | Marketing Team'''
+Best,
+Sam
+www.brand.com'''
     assert "[KOL Name]" in OUTREACH_LETTER_FORMULA
     assert "[代表视频标题]" in OUTREACH_LETTER_FORMULA
     assert "[Channel ID]" in OUTREACH_LETTER_FORMULA

@@ -87,6 +87,9 @@ INFLUENCERS_FIELDS = [
     ("频道描述", 1),
     ("频道初步判断", 1),
     ("联系邮箱", 1),
+    ("apify邮箱", 1),
+    ("最近视频平均播放量", 2),
+    ("最近视频中位播放量", 2),
     ("邮箱状态", 3),
     ("代表视频URL", 15),
     ("代表视频标题", 1),
@@ -244,7 +247,7 @@ def format_search_video_record(video: dict, keyword: str = "") -> dict:
         "Channel Name": str(video.get("channel_title", "")),
         "Video Title": str(video.get("title", "")),
         "Publish Time": _ts(video.get("published_at")),
-        "Views": video.get("view_count", 0),
+        "Views": None if video.get("view_count_available") is False else video.get("view_count", 0),
         "Likes": video.get("like_count", 0),
         "Comments": video.get("comment_count", 0),
         "互动率(%)": video.get("engagement_rate", 0.0),
@@ -299,6 +302,9 @@ def format_influencer_record(channel: dict, rep_video: dict, keyword: str = "") 
         "开发状态": "待联系",
     })
 
+    if channel.get("recent_video_metrics_status") == "success":
+        from workflow.recent_video_metrics import metric_fields
+        fields.update(metric_fields(channel))
     return {"fields": fields}
 
 
@@ -313,7 +319,7 @@ def format_influencer_video_record(video: dict, channel_title: str = "") -> dict
         "Video ID": video_id,
         "Video Title": str(video.get("title", "")),
         "Publish Time": _ts(video.get("published_at")),
-        "Views": video.get("view_count", 0),
+        "Views": None if video.get("view_count_available") is False else video.get("view_count"),
         "Likes": video.get("like_count", 0),
         "Comments": video.get("comment_count", 0),
         "互动率(%)": video.get("engagement_rate", 0.0),

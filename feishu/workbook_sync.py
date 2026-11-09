@@ -131,7 +131,7 @@ TABLE_CONFIGS: Dict[str, Dict[str, Any]] = {
         "field_map": _identity_field_map(feishu_schema.INFLUENCERS_FIELDS),
         "header_aliases": LEGACY_HEADER_ALIASES["influencers"],
         "read_only_fields": _read_only_fields(feishu_schema.INFLUENCERS_FIELDS),
-        "preserve_existing_nonblank": {"联系邮箱", "开发状态", "开发负责人", "备注"},
+        "preserve_existing_nonblank": {"联系邮箱", "apify邮箱", "开发状态", "开发负责人", "备注"},
     },
     "influencer_videos": {
         "sheet": "influencer_videos",
@@ -186,7 +186,8 @@ def load_source_rows(workbook_path: Path, sheet_name: str, limit: Optional[int] 
     if limit is not None:
         df = df.head(limit)
     df = df.where(pd.notna(df), None)
-    return df.to_dict(orient="records")
+    from export.excel_exporter import read_snapshot_metadata
+    return read_snapshot_metadata(workbook_path, df.to_dict(orient="records"), sheet_name)
 
 
 def load_table_source_rows(
@@ -359,6 +360,10 @@ def build_fields(
     preserve_nonblank = config.get("preserve_existing_nonblank", set())
     read_only_fields = config.get("read_only_fields", set())
 
+    from workflow.recent_video_metrics import METRIC_FIELDS
+    metrics_complete = all(not is_blank(source_row.get(name)) for name in METRIC_FIELDS)
+    empty_success = ((source_row.get("__recent_snapshot__") or {}).get("status") == "success"
+                     and all(is_blank(source_row.get(name)) for name in METRIC_FIELDS))
     for source_column, target_field in config["field_map"].items():
         if only_target_fields and target_field not in only_target_fields:
             continue
@@ -374,6 +379,12 @@ def build_fields(
             source_row.get(source_column),
         ):
             continue
+        if target_field in METRIC_FIELDS:
+            if empty_success:
+                fields[target_field] = None
+                continue
+            if not metrics_complete:
+                continue
         source_value = source_row.get(source_column)
         if target_field == "邮箱状态":
             source_value = _email_status(source_row, config, existing_fields)
@@ -648,6 +659,8 @@ def verify_table(
         if field_to_text(fields.get(PRIMARY_FIELD)):
             mismatches.append({"key": key, "field": PRIMARY_FIELD, "issue": "primary field is not blank"})
 
+        from workflow.recent_video_metrics import METRIC_FIELDS
+        expected_metrics = build_fields(row, config, field_meta, fields, only_target_fields=set(METRIC_FIELDS))
         for source_column, target_field in config["field_map"].items():
             if only_target_fields and target_field not in only_target_fields:
                 continue
@@ -666,9 +679,14 @@ def verify_table(
             source_value = row.get(source_column)
             if target_field == "邮箱状态":
                 source_value = _email_status(row, config, fields)
-            expected = expected_value(source_value, target_field, field_meta[target_field])
-            if expected is None:
-                continue
+            if target_field in METRIC_FIELDS:
+                if target_field not in expected_metrics:
+                    continue
+                expected = expected_metrics[target_field]
+            else:
+                expected = expected_value(source_value, target_field, field_meta[target_field])
+                if expected is None:
+                    continue
             actual = comparable_value(fields.get(target_field), field_meta[target_field])
             if actual != expected:
                 mismatches.append(

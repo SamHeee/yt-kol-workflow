@@ -32,17 +32,18 @@ def test_phase_d_runtime_request_count_matches_estimate(monkeypatch):
         calls["channel_detail"] += 1
         return [{"channel_id": channel_id, "channel_title": "Creator"} for channel_id in kwargs["channel_ids"]], ""
 
-    def uploads(**kwargs):
+    from youtube import recent_videos
+    current = {}
+    def uploads(url, params, **kwargs):
         calls["recent_videos"] += 1
-        return ["abcdefghijk"], ""
-
-    def videos(**kwargs):
+        current["cid"] = "UC" + params["playlistId"][2:]
+        return True, {"items": [{"contentDetails": {"videoId": "abcdefghijk"}}]}, ""
+    def videos(*args, **kwargs):
         calls["recent_video_detail"] += 1
-        return [{"video_id": "abcdefghijk", "published_at_raw": "2026-10-01T00:00:00Z"}], [], ""
-
+        return [{"video_id": "abcdefghijk", "channel_id": current["cid"], "published_at_raw": "2026-10-01T00:00:00Z"}], [], ""
     monkeypatch.setattr(phase_d_detail, "fetch_channel_details", channels)
-    monkeypatch.setattr(phase_d_detail, "get_channel_uploads", uploads)
-    monkeypatch.setattr(phase_d_detail, "fetch_video_details", videos)
+    monkeypatch.setattr(recent_videos, "api_request", uploads)
+    monkeypatch.setattr(recent_videos, "fetch_video_details", videos)
     _, _, error = phase_d_detail.run_phase_d("key", [{"channel_id": f"UC{i}"} for i in range(15)])
     assert error == ""
     estimated = estimate_channel_detail_cost(15)

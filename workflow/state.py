@@ -12,7 +12,7 @@ from workflow.persistence import atomic_write_json
 
 logger = logging.getLogger("kol_workflow.workflow.state")
 
-CURRENT_DATA_SCHEMA_VERSION = 2
+CURRENT_DATA_SCHEMA_VERSION = 3
 
 
 class WorkflowState:
@@ -96,7 +96,7 @@ class WorkflowState:
         if data["data_schema_version"] < CURRENT_DATA_SCHEMA_VERSION:
             logger.warning(
                 "状态文件数据版本为 %s，当前版本为 %s；已完成的阶段D不会自动补齐新字段，"
-                "请运行 refresh-influencers。",
+                "请运行 refresh-influencers --fields recent-views 补齐最近视频指标。",
                 data["data_schema_version"],
                 CURRENT_DATA_SCHEMA_VERSION,
             )

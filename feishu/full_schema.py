@@ -4,8 +4,8 @@
 
 This module is deliberately separate from :mod:`feishu.schema`.  The latter is
 the stable four-table discovery/Excel contract; adding operational fields to it
-would change generated workbook columns.  ``FULL_SCHEMA`` layers the two
-operational fields on ``网红详情表`` and the three operations tables on top of
+would change generated workbook columns.  ``FULL_SCHEMA`` layers the
+operational formula fields on ``网红详情表`` and the three operations tables on top of
 that contract so a new Base can be provisioned without changing Excel output.
 
 Only metadata lives here.  Provisioning, transport, repair policy and workflow
@@ -167,12 +167,12 @@ class FieldSpec:
                     "percentage": False,
                     "thousands_separator": True,
                 }
-            elif self.number_format == "0.00":
+            elif self.number_format in {"0.00", "1,000.00"}:
                 payload["style"] = {
                     "type": "plain",
                     "precision": 2,
                     "percentage": False,
-                    "thousands_separator": False,
+                    "thousands_separator": self.number_format == "1,000.00",
                 }
         elif field_type == "select":
             payload["multiple"] = bool(self.multiple)
@@ -317,7 +317,7 @@ def _fields_from_pairs(
     return tuple(result)
 
 
-OUTREACH_LETTER_TEMPLATE = '''Hello “KOL Name”,
+LEGACY_OUTREACH_LETTER_TEMPLATE = '''Hello “KOL Name”,
 
 This is Sam from Brand. We came across your video "代表视频标题" and found it very helpful.
 
@@ -334,7 +334,7 @@ Sam | Marketing Team'''
 # The user-provided text above is the durable content SSOT.  The expression
 # preserves its two placeholder locations as dynamic field references and gates
 # output until all required enrichment data is available.
-OUTREACH_LETTER_FORMULA = (
+LEGACY_OUTREACH_LETTER_FORMULA = (
     'IF(AND(NOT(ISBLANK([Channel ID])),NOT(ISBLANK([KOL Name])),'
     '[KOL Name]!="手动确认",NOT(ISBLANK([代表视频标题]))),'
     '"Hello “"&[KOL Name]&"”,"&CHAR(10)&CHAR(10)&'
@@ -345,11 +345,36 @@ OUTREACH_LETTER_FORMULA = (
     'CHAR(10)&CHAR(10)&"Best regards,"&CHAR(10)&"Sam | Marketing Team","")'
 )
 
+
+OUTREACH_LETTER_TEMPLATE = """Hello KOL Name,
+
+This is Sam from xxx, a brand that makes xxx. We came across your video "代表视频标题" and found it very helpful.
+
+We'd like to propose a gifted collaboration: we'll send you a free [product] to keep, and in return you'd share your honest thoughts in a dedicated video or a short integration in an upcoming one, whichever works best for your channel.
+
+If this sounds good, reply with your shipping address and a rough idea of when you could post.
+
+Best,
+Sam
+www.brand.com"""
+OUTREACH_LETTER_FORMULA = ('IF(AND(NOT(ISBLANK([Channel ID])),NOT(ISBLANK([KOL Name])),[KOL '
+ 'Name]!="手动确认",NOT(ISBLANK([代表视频标题]))),"Hello "&[KOL Name]&","&CHAR(10)&CHAR(10)&"This is Sam '
+ 'from xxx, a brand that makes xxx. We came across your video "&CHAR(34)&[代表视频标题]&CHAR(34)&" and '
+ 'found it very helpful."&CHAR(10)&CHAR(10)&"We\'d like to propose a gifted collaboration: we\'ll '
+ "send you a free [product] to keep, and in return you'd share your honest thoughts in a dedicated "
+ 'video or a short integration in an upcoming one, whichever works best for your '
+ 'channel."&CHAR(10)&CHAR(10)&"If this sounds good, reply with your shipping address and a rough '
+ 'idea of when you could '
+ 'post."&CHAR(10)&CHAR(10)&"Best,"&CHAR(10)&"Sam"&CHAR(10)&"www.brand.com","")')
+EMAIL_SUBJECT_FORMULA = 'IF(ISBLANK([Channel Name]),"","Collab idea: Brand × "&[Channel Name])'
+
 EMAIL_INDEX_FORMULA = "LOWER(TRIM([联系邮箱]))"
 COOPERATION_RECORD_ID_FORMULA = "IFBLANK([手动编号],[自动编号])"
 
 
 INFLUENCER_OPERATIONS_FIELDS = (
+    FieldSpec("邮件主题", FORMULA, formula=EMAIL_SUBJECT_FORMULA,
+              description="合作邮件主题草稿。", is_operations_extension=True),
     FieldSpec(
         "邮箱索引",
         FORMULA,
@@ -543,7 +568,9 @@ SEARCH_TASK_TABLE_SPEC = TableSpec(
 )
 SEARCH_VIDEO_TABLE_SPEC = TableSpec(
     SEARCH_VIDEOS_TABLE,
-    _fields_from_pairs(tuple(SEARCH_VIDEOS_FIELDS)),
+    _fields_from_pairs(tuple(SEARCH_VIDEOS_FIELDS), properties={
+        name: {"number_format": "1,000"} for name in ("Views", "Likes", "Comments")
+    }),
     dependencies=(SEARCH_TASKS_TABLE,),
     excel_contract=True,
 )
@@ -552,6 +579,10 @@ INFLUENCER_TABLE_SPEC = TableSpec(
     _fields_from_pairs(
         tuple(INFLUENCERS_FIELDS),
         select_options={**CORE_SELECT_OPTIONS, **INFLUENCERS_FIELD_OPTIONS},
+        properties={
+            **{name: {"number_format": "1,000"} for name in ("订阅数", "频道总播放量", "视频总数", "代表视频播放量")},
+            **{name: {"number_format": "1,000.00"} for name in ("最近视频平均播放量", "最近视频中位播放量")},
+        },
     )
     + INFLUENCER_OPERATIONS_FIELDS,
     dependencies=(SEARCH_VIDEO_TABLE_SPEC.name,),

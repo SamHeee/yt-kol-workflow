@@ -1232,6 +1232,14 @@ def build_parser() -> argparse.ArgumentParser:
     # ---- quota ----
     subparsers.add_parser("quota", help="查看配额说明")
 
+    sp_upgrade = subparsers.add_parser("feishu-upgrade", help="预览或应用最近视频与邮件字段升级")
+    sp_upgrade.add_argument("--feishu-app-token", required=True, help="明确指定已有 Base token 或 URL")
+    _add_feishu_auth_args(sp_upgrade)
+    mode = sp_upgrade.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true", help="应用字段升级；默认只预览")
+    mode.add_argument("--dry-run", action="store_true", help="只预览（默认）")
+    sp_upgrade.add_argument("--report", default="", help="升级计划与执行日志 JSON 路径")
+
     # ---- feishu-setup ----
     sp_feishu_setup = subparsers.add_parser(
         "feishu-setup",
@@ -1314,7 +1322,7 @@ def build_parser() -> argparse.ArgumentParser:
     # ---- refresh-influencers ----
     sp_refresh = subparsers.add_parser(
         "refresh-influencers",
-        help="回填或刷新飞书中已有网红的姓名、活跃度、频道判断和代表视频标题",
+        help="刷新已有网红的姓名、活跃度、频道判断、代表视频标题和最近视频统计",
     )
     sp_refresh.add_argument(
         "--feishu-app-token",
@@ -1328,10 +1336,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp_refresh.add_argument(
         "--fields",
-        choices=["all", "name", "activity", "assessment", "rep-title"],
+        choices=["all", "name", "activity", "assessment", "rep-title", "recent-views"],
         default="all",
         help="只刷新指定字段组（默认 all）",
     )
+    sp_refresh.add_argument("--recent-source", choices=["youtube", "table"], default="youtube",
+                            help="最近视频统计来源；table 仅重算已有视频，youtube 采集最新视频")
     sp_refresh.add_argument("--channel-id", action="append", default=[], help="只刷新指定 Channel ID，可重复")
     sp_refresh.add_argument("--limit", type=int, default=None, help="最多处理记录数")
     sp_refresh.add_argument("--dry-run", action="store_true", help="只生成更新计划，不写记录")
@@ -1343,7 +1353,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp_refresh.add_argument(
         "--ensure-schema",
         action="store_true",
-        help="先补齐网红详情表字段；该操作即使配合 --dry-run 也会修改表结构",
+        help="先补齐网红详情表字段；不能与 --dry-run 同用；格式和公式升级使用 feishu-upgrade",
     )
     sp_refresh.add_argument("--stats", default="", help="统计 JSON 输出路径")
     _add_feishu_auth_args(sp_refresh)
@@ -1600,6 +1610,10 @@ def main():
         print("  方案2 (search):       ~1718 units → 每日可处理 ~5 关键词")
         return
 
+    if args.command == "feishu-upgrade":
+        handle_feishu_upgrade(args)
+        return
+
     if args.command == "feishu-setup":
         handle_feishu_setup(args)
         return
@@ -1803,6 +1817,50 @@ def handle_merge_output(args):
         print(f"  {table_key}: {stats['output_rows']} 行 (去重 {removed} 行)")
 
 
+def handle_feishu_upgrade(args):
+    from feishu.lark_cli_base import LarkCliBaseRunner
+    from feishu.schema_migrations import plan_upgrade, apply_upgrade
+    from workflow.persistence import atomic_write_json
+
+    cfg = _feishu_config_from_args(args)
+    context = _create_feishu_context(cfg, create_base_if_missing=False)
+    if context.auth_mode != "cli":
+        raise RuntimeError("字段升级需要 CLI 身份")
+    admin = LarkCliBaseRunner(
+        base_token=context.app_token, profile=cfg.cli_profile,
+        cli_path=getattr(context.cli_manager, "cli_path", "") or cfg.cli_path or "lark-cli",
+        timeout=min(max(cfg.auth_timeout_seconds, 30), 300),
+    )
+    plan = plan_upgrade(admin)
+    report_path = Path(args.report) if args.report else PROJECT_ROOT / "output" / (
+        "schema_upgrade_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".json")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report = {"plan": plan, "applied": [], "status": "preview"}
+    atomic_write_json(report_path, report)
+    for action in plan["actions"]:
+        print(f"  {action['kind']}: {action['table']}.{action['field']}")
+    for conflict in plan["conflicts"]:
+        print(f"  冲突: {conflict}")
+    print(f"升级报告: {report_path}")
+    if plan["conflicts"]:
+        raise RuntimeError("升级计划存在冲突，未执行写入")
+    if args.apply:
+        def journal(action):
+            report["applied"].append(action)
+            report["status"] = "applying"
+            atomic_write_json(report_path, report)
+        try:
+            apply_upgrade(admin, plan, journal=journal)
+        except Exception as exc:
+            report["status"] = "failed"
+            report["error"] = str(exc)
+            atomic_write_json(report_path, report)
+            raise
+        report["status"] = "verified"
+        atomic_write_json(report_path, report)
+        print("字段升级完成，已读回核验。")
+
+
 def handle_feishu_setup(args):
     """Prepare either the legacy four-table scope or the complete workspace."""
     feishu_cfg = _feishu_config_from_args(args)
@@ -1993,21 +2051,24 @@ def handle_clean_feishu_empty(args):
 
 
 def handle_refresh_influencers(args):
-    """Backfill/refresh the five influencer enrichment fields."""
+    """Refresh existing influencer enrichment and recent-video statistics."""
     from feishu.schema import INFLUENCERS_FIELDS, ensure_influencer_field_options
     from workflow.refresh_influencers import refresh_influencers
 
     feishu_cfg = _feishu_config_from_args(args)
     youtube_cfg = YouTubeConfig(api_key=args.youtube_api_key)
     missing_config = []
-    if not youtube_cfg.api_key:
+    recent_source = getattr(args, "recent_source", "youtube")
+    if recent_source == "table" and args.fields != "recent-views":
+        raise RuntimeError("--recent-source table 仅支持 --fields recent-views")
+    if not youtube_cfg.api_key and recent_source != "table":
         missing_config.append("YOUTUBE_API_KEY")
     if missing_config:
         raise RuntimeError("刷新网红详情缺少配置: " + ", ".join(missing_config))
 
     context = _create_feishu_context(
         feishu_cfg,
-        create_base_if_missing=not args.dry_run,
+        create_base_if_missing=False,
     )
     _ensure_created_base_schema(context)
     client = context.client
@@ -2015,6 +2076,8 @@ def handle_refresh_influencers(args):
     if not table_id:
         raise RuntimeError(f"飞书数据表不存在: {INFLUENCERS_TABLE}")
 
+    if args.ensure_schema and args.dry_run:
+        raise RuntimeError("--ensure-schema 不能与 --dry-run 同用；请先完成字段升级")
     if args.ensure_schema:
         client.ensure_fields(table_id, INFLUENCERS_FIELDS)
         ensure_influencer_field_options(client, table_id)
@@ -2023,13 +2086,22 @@ def handle_refresh_influencers(args):
             item.get("field_name", "")
             for item in client.list_fields(table_id)
         }
-        required = {"KOL Name", "最新发布日期", "断更评估", "频道初步判断", "代表视频标题"}
+        required_by_group = {"name": {"KOL Name"}, "activity": {"最新发布日期", "断更评估"},
+                             "assessment": {"频道初步判断"}, "rep-title": {"代表视频标题"},
+                             "recent-views": {"最近视频平均播放量", "最近视频中位播放量"}}
+        required = set().union(*required_by_group.values()) if args.fields == "all" else required_by_group[args.fields]
         missing_fields = sorted(required - existing_fields)
         if missing_fields:
             raise RuntimeError(
                 f"网红详情表缺少新增字段: {missing_fields}；请先运行一次 --ensure-schema"
             )
 
+    videos_table_id = ""
+    if args.fields in {"all", "recent-views"}:
+        from feishu.schema import INFLUENCER_VIDEOS_TABLE
+        videos_table_id = client.find_table_by_name(INFLUENCER_VIDEOS_TABLE)
+        if not videos_table_id:
+            raise RuntimeError("缺少网红视频表")
     quota_tracker = QuotaTracker(youtube_cfg.daily_quota)
     result = refresh_influencers(
         api_key=youtube_cfg.api_key,
@@ -2041,6 +2113,8 @@ def handle_refresh_influencers(args):
         dry_run=args.dry_run,
         quota_tracker=quota_tracker,
         replace_kol_names=args.replace_kol_names,
+        videos_table_id=videos_table_id,
+        recent_source=recent_source,
     )
     result["quota_used"] = quota_tracker.used
     result["finished_at"] = datetime.now().isoformat(timespec="seconds")
@@ -2062,6 +2136,8 @@ def handle_refresh_influencers(args):
     print(f"  API/解析错误: {len(result['errors'])}")
     print(f"  配额消耗: {result['quota_used']}")
     print(f"  统计: {stats_path}")
+    if result["errors"]:
+        raise RuntimeError("部分网红刷新失败，已有成功结果已保存；请查看统计报告")
 
 
 def handle_refresh_cooperation_content(args):

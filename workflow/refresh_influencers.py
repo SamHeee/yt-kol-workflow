@@ -10,20 +10,22 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Set
 
 from feishu.bitable import BitableClient
-from feishu.value_utils import field_to_text
+from feishu.value_utils import field_to_text, number_value
 from filter.activity_evaluator import evaluate_channel_activity
 from filter.channel_classifier import classify_channel
 from filter.email_extractor import extract_email
 from filter.kol_name_extractor import extract_kol_name
 from youtube.channels import fetch_channel_details
-from youtube.playlists import get_channel_uploads
+from youtube.recent_videos import collect_recent_videos
+from workflow.recent_video_metrics import calculate_recent_metrics, select_table_videos, metric_fields, METRIC_FIELDS
+from workflow.recent_video_store import save_sample, table_videos
 from youtube.quota import estimate_channel_detail_cost
 from youtube.videos import extract_video_id, fetch_video_details
 
 
 logger = logging.getLogger("kol_workflow.workflow.refresh_influencers")
 
-ALL_REFRESH_FIELDS = {"name", "activity", "assessment", "rep-title"}
+ALL_REFRESH_FIELDS = {"name", "activity", "assessment", "rep-title", "recent-views"}
 
 
 def refresh_influencers(
@@ -38,8 +40,10 @@ def refresh_influencers(
     quota_tracker=None,
     recent_video_count: int = 10,
     replace_kol_names: bool = False,
+    videos_table_id: str = "",
+    recent_source: str = "youtube",
 ) -> Dict[str, Any]:
-    """Refresh only the five enrichment fields on existing Feishu rows.
+    """Refresh selected enrichment fields and recent-upload statistics.
 
     Existing confirmed KOL names are never overwritten by default. The
     placeholder ``手动确认`` may be upgraded when a later run finds a confident
@@ -48,6 +52,12 @@ def refresh_influencers(
     Other business/manual fields are not included in update payloads.
     """
     selected = _selected_fields(fields)
+    if recent_source not in {"youtube", "table"}:
+        raise ValueError("未知最近视频数据源")
+    if recent_source == "table" and selected != {"recent-views"}:
+        raise ValueError("table 数据源仅支持 --fields recent-views")
+    if "recent-views" in selected and not videos_table_id:
+        raise ValueError("最近视频统计需要网红视频表")
     requested_ids = {str(value).strip() for value in (channel_ids or []) if str(value).strip()}
 
     records = []
@@ -77,7 +87,7 @@ def refresh_influencers(
         if limit is not None and len(records) >= limit:
             break
 
-    estimated_quota = _estimate_quota(records, selected, recent_video_count=recent_video_count)
+    estimated_quota = 0 if recent_source == "table" else _estimate_quota(records, selected, recent_video_count=recent_video_count)
     if quota_tracker is not None and estimated_quota > quota_tracker.remaining():
         raise RuntimeError(
             f"刷新预计需要约 {estimated_quota} units，当前进程预算仅剩 "
@@ -120,6 +130,10 @@ def refresh_influencers(
     manual_confirmation_count = 0
     errors: List[Dict[str, str]] = []
 
+    recent_cache = {}
+    snapshots = {}
+    source_videos = table_videos(client.get_all_records(videos_table_id)) if recent_source == "table" else []
+
     for record in records:
         record_id = record.get("record_id", "")
         existing = record.get("fields") or {}
@@ -145,20 +159,31 @@ def refresh_influencers(
 
         recent_videos: List[Dict[str, Any]] = []
         recent_error = ""
-        if selected & {"activity", "assessment"}:
-            video_ids, recent_error = get_channel_uploads(
-                api_key=api_key,
-                channel_id=channel_id,
-                uploads_playlist_id=str(channel.get("uploads_playlist_id", "") or ""),
-                max_results=recent_video_count,
-                quota_tracker=quota_tracker,
-            )
-            if not recent_error and video_ids:
-                recent_videos, _, recent_error = fetch_video_details(
-                    api_key,
-                    video_ids,
-                    quota_tracker=quota_tracker,
-                )
+        if selected & {"activity", "assessment", "recent-views"}:
+            if channel_id not in recent_cache:
+                try:
+                    if recent_source == "table":
+                        fetched = select_table_videos(source_videos, channel_id, recent_video_count)
+                        recent_cache[channel_id] = (fetched, "")
+                    else:
+                        recent_cache[channel_id] = collect_recent_videos(
+                            api_key, channel_id,
+                            uploads_playlist_id=str(channel.get("uploads_playlist_id", "") or ""),
+                            count=recent_video_count, quota_tracker=quota_tracker,
+                        )
+                except ValueError as exc:
+                    recent_cache[channel_id] = ([], str(exc))
+            recent_videos, recent_error = recent_cache[channel_id]
+            for video in recent_videos:
+                video["channel_title"] = channel_name
+
+        if "recent-views" in selected:
+            if recent_error:
+                errors.append({"channel_id": channel_id, "stage": "recent-views", "error": recent_error})
+            else:
+                snapshot = calculate_recent_metrics(recent_videos, channel_id=channel_id)
+                snapshots[channel_id] = snapshot
+                update_fields.update(metric_fields(snapshot))
 
         if "activity" in selected:
             activity = evaluate_channel_activity(recent_videos, fetch_error=recent_error)
@@ -194,6 +219,22 @@ def refresh_influencers(
             updates.append({"record_id": record_id, "fields": update_fields})
             if len(samples) < 10:
                 samples.append({"channel_id": channel_id, "fields": update_fields})
+
+    video_records_saved = 0
+    if "recent-views" in selected and recent_source == "youtube" and not dry_run:
+        video_inventory = client.get_all_records(videos_table_id) if snapshots else []
+        for cid in list(snapshots):
+            try:
+                video_records_saved += save_sample(client, videos_table_id, recent_cache[cid][0], video_inventory)
+            except Exception as exc:
+                errors.append({"channel_id": cid, "stage": "save-videos", "error": str(exc)})
+                snapshots.pop(cid)
+        by_record_id = {r["record_id"]: field_to_text((r.get("fields") or {}).get("Channel ID")) for r in records}
+        for update in updates:
+            if by_record_id[update["record_id"]] not in snapshots:
+                for name in METRIC_FIELDS:
+                    update["fields"].pop(name, None)
+        updates = [u for u in updates if u["fields"]]
 
     actual_updates = 0
     concurrent_skips = 0
@@ -235,13 +276,34 @@ def refresh_influencers(
                 ):
                     safe_fields.pop("KOL Name")
                     protected_names += 1
+                if any(name in safe_fields for name in METRIC_FIELDS) and any(
+                        number_value(latest.get(name)) != number_value(original.get(name))
+                        for name in METRIC_FIELDS):
+                    for name in METRIC_FIELDS:
+                        safe_fields.pop(name, None)
+                    concurrent_skips += 1
                 if safe_fields:
                     safe_updates.append({"record_id": record_id, "fields": safe_fields})
             if safe_updates:
-                actual_updates += client.batch_update_records(table_id, safe_updates)
+                written = client.batch_update_records(table_id, safe_updates)
+                actual_updates += written
+                if written != len(safe_updates):
+                    errors.append({"stage": "write-creators", "error": "网红更新数量不一致"})
+                metric_updates = [u for u in safe_updates if all(k in u["fields"] for k in METRIC_FIELDS)]
+                if metric_updates:
+                    checked = {r["record_id"]: r.get("fields") or {} for r in client.batch_get_records(
+                        table_id, [u["record_id"] for u in metric_updates])}
+                    for update in metric_updates:
+                        actual = checked.get(update["record_id"])
+                        if actual is None or any(not _metric_equal(actual.get(k), update["fields"][k]) for k in METRIC_FIELDS):
+                            errors.append({"record_id": update["record_id"], "stage": "verify-metrics",
+                                           "error": "频道指标读回不一致"})
 
     return {
         "selected_fields": sorted(selected),
+        "recent_source": recent_source,
+        "recent_video_snapshots": snapshots,
+        "video_records_saved": video_records_saved,
         "source_records": len(records),
         "estimated_quota": estimated_quota,
         "planned_updates": len(updates),
@@ -283,7 +345,7 @@ def _estimate_quota(
     cost = 0
     if selected & {"name", "assessment"}:
         cost += math.ceil(count / 50)  # channels.list
-    if selected & {"activity", "assessment"}:
+    if selected & {"activity", "assessment", "recent-views"}:
         detail = estimate_channel_detail_cost(count, recent_video_count=recent_video_count)
         cost += detail["recent_videos"] + detail["recent_video_detail"]
     if "rep-title" in selected:
@@ -299,3 +361,13 @@ def _estimate_quota(
 def _utc_timestamp_ms(value: str) -> int:
     parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
     return int(parsed.timestamp() * 1000)
+
+
+def _metric_equal(actual, expected):
+    if expected is None:
+        return actual is None
+    if isinstance(actual, bool):
+        return False
+    parsed = number_value(actual)
+    return parsed is not None and math.isfinite(parsed) and math.isclose(
+        parsed, expected, rel_tol=1e-9, abs_tol=1e-8)

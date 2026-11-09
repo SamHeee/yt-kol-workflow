@@ -201,7 +201,7 @@ def _managed_field_conflicts(field_spec: Any, existing: Mapping[str, Any]) -> Li
         if not isinstance(actual.get("style"), Mapping):
             errors.append("字段定义缺少 style")
         elif dict(actual["style"]) != target_style:
-            errors.append("字段 style 不一致")
+            errors.append("字段 style 不一致；本次统计字段升级请先运行 feishu-upgrade --dry-run")
 
     if "multiple" in target and actual.get("multiple") != target.get("multiple"):
         errors.append(
@@ -219,7 +219,7 @@ def _managed_field_conflicts(field_spec: Any, existing: Mapping[str, Any]) -> Li
         if expression is None:
             errors.append("字段定义缺少公式 expression")
         elif str(expression) != str(target.get("expression")):
-            errors.append("公式定义不一致")
+            errors.append("公式定义不一致；模板升级请先运行 feishu-upgrade --dry-run")
     elif target_type == "lookup":
         for key in ("from", "select", "aggregate", "where"):
             if key not in actual:

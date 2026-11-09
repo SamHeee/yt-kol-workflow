@@ -17,7 +17,7 @@ from export.excel_exporter import ExcelExporter
 from workflow import persistence
 from workflow.seen_channels import SeenChannelStore
 from workflow.state import WorkflowState
-from youtube import channels, playlists, search, videos
+from youtube import channels, playlists, search, videos, recent_videos
 
 
 @pytest.fixture(autouse=True)
@@ -59,7 +59,7 @@ class YouTubeScenario:
         self.search_queries = []
         self.upload_actions = defaultdict(list)
         self.video_actions = defaultdict(list)
-        for module in (channels, playlists, search, videos):
+        for module in (channels, playlists, search, videos, recent_videos):
             monkeypatch.setattr(module, "api_request", self.request)
 
     def request(self, url, params, quota_tracker=None, api_name=""):
